@@ -24,7 +24,6 @@ Desktop auto clicker with mouse/keyboard actions, rule-based triggers, macro rec
   - Edge-trigger mode (non-match -> match)
   - Inkdropper with lock key capture
   - Pixel history panel
-  - Optional crosshair overlay
 - Window binding:
   - Active window title contains rule text
   - One-click capture from the current foreground window (Windows)
@@ -102,6 +101,12 @@ Inkdrop lock key default: `s` (single key).
 
 - `profiles.json`: saved profiles
 - `recordings.json`: saved macro recordings
+
+## Code Layout
+
+- `autoclicker.py`: main app state, runtime logic, and tab/test delegation
+- `ui/tabs/`: one module per main app tab UI builder
+- `ui/tests/`: testing window + one module per test tab UI builder
 
 ## Testing
 
