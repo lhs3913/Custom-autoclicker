@@ -1,5 +1,6 @@
 import ctypes
 import colorsys
+import copy
 import json
 import math
 import os
@@ -11,7 +12,7 @@ import tkinter as tk
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 from PIL import Image, ImageGrab, ImageTk
 from pynput import keyboard, mouse
@@ -20,6 +21,7 @@ from pynput.mouse import Button
 
 PROFILE_FILE_NAME = "profiles.json"
 RECORDINGS_FILE_NAME = "recordings.json"
+RUN_LOG_FILE_NAME = "run_logs.jsonl"
 TEMP_RECORDING_NAME = "(temporary)"
 
 
@@ -63,6 +65,8 @@ class ClickSettings:
     use_macro_recording: bool
     selected_recording_name: str
     macro_speed: float
+    macro_reanchor_window: bool
+    macro_dry_run: bool
 
 
 @dataclass(slots=True)
@@ -141,8 +145,9 @@ class AutoClickerApp:
         self.recordings_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), RECORDINGS_FILE_NAME
         )
+        self.run_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), RUN_LOG_FILE_NAME)
         self.profiles: dict[str, dict[str, object]] = {}
-        self.recordings: dict[str, list[dict[str, object]]] = {}
+        self.recordings: dict[str, dict[str, object]] = {}
 
         self.monitor_options = self._detect_monitors()
 
@@ -153,6 +158,8 @@ class AutoClickerApp:
         self.recording_mouse_listener: mouse.Listener | None = None
         self.recording_last_move_time = 0.0
         self.recording_last_move_pos: tuple[int, int] | None = None
+        self.recording_anchor_title = ""
+        self.recording_anchor_rect: Rect | None = None
 
         self.pixel_history: list[str] = []
         self.last_color_condition_match = False
@@ -193,6 +200,7 @@ class AutoClickerApp:
         self.tolerance_var = tk.StringVar(value="20")
         self.color_preview_text_var = tk.StringVar(value="#FFFFFF")
         self.edge_trigger_var = tk.BooleanVar(value=False)
+        self.color_trigger_mode_var = tk.StringVar(value="continuous")
         self.pixel_history_enabled_var = tk.BooleanVar(value=True)
         self.condition_logic_mode_var = tk.StringVar(value="and")
 
@@ -224,6 +232,14 @@ class AutoClickerApp:
         self.selected_recording_var = tk.StringVar(value=TEMP_RECORDING_NAME)
         self.recording_name_var = tk.StringVar(value="")
         self.macro_speed_var = tk.StringVar(value="1.0")
+        self.recording_coordinate_mode_var = tk.StringVar(value="window_relative")
+        self.macro_reanchor_window_var = tk.BooleanVar(value=True)
+        self.macro_dry_run_var = tk.BooleanVar(value=False)
+
+        self.macro_selected_step_var = tk.StringVar(value="No step selected")
+        self.macro_step_delay_var = tk.StringVar(value="0.000")
+        self.macro_step_type_var = tk.StringVar(value="")
+        self.macro_step_payload_var = tk.StringVar(value="")
 
         self.status_var = tk.StringVar(value="Idle")
         self.session_info_var = tk.StringVar(value="Clicks: 0 | Elapsed: 0.0s")
@@ -256,22 +272,42 @@ class AutoClickerApp:
 
         self.profile_combo: ttk.Combobox | None = None
         self.recording_combo: ttk.Combobox | None = None
+        self.macro_step_tree: ttk.Treeview | None = None
+        self.macro_step_apply_button: ttk.Button | None = None
         self.pixel_history_listbox: tk.Listbox | None = None
         self.window_rule_entry: ttk.Entry | None = None
         self.time_start_entry: ttk.Entry | None = None
         self.time_end_entry: ttk.Entry | None = None
 
         self.test_window: tk.Toplevel | None = None
+        self.test_notebook: ttk.Notebook | None = None
+        self.test_tab_frames: dict[str, ttk.Frame] = {}
         self.test_center_button: tk.Button | None = None
         self.test_center_auto_toggle_button: ttk.Button | None = None
         self.test_color_wheel_image: ImageTk.PhotoImage | None = None
         self.test_center_auto_after_id: str | None = None
+        self.test_click_buttons_container: ttk.Frame | None = None
+        self.test_color_wheel_canvas: tk.Canvas | None = None
+        self.test_color_wheel_size = 0
+        self.test_color_wheel_pick_enabled = False
+        self.test_color_wheel_pick_after_id: str | None = None
+
+        self.dry_run_overlay: tk.Toplevel | None = None
+        self.dry_run_canvas: tk.Canvas | None = None
+        self.dry_run_overlay_origin = (0, 0)
+        self.dry_run_last_point: tuple[int, int] | None = None
+        self.dry_run_clear_after_id: str | None = None
 
         self.test_button_one_count = 0
         self.test_button_two_count = 0
+        self.test_click_targets: dict[int, dict[str, object]] = {}
+        self.test_click_target_next_id = 1
+        self.test_click_new_button_name_var = tk.StringVar(value="")
         self.test_center_click_count = 0
         self.test_center_current_color = "#1f7a8c"
         self.test_center_auto_color_enabled = False
+        self.test_color_wheel_lock_key_var = tk.StringVar(value="l")
+        self.test_color_wheel_lock_status_var = tk.StringVar(value="Wheel lock: off")
         self.test_letter_total_count = 0
         self.test_letter_counts: dict[str, int] = {}
         self.test_obstacle_count = 0
@@ -284,8 +320,8 @@ class AutoClickerApp:
         self.test_center_color_var = tk.StringVar(value="Current center color: #1F7A8C")
         self.test_center_random_interval_var = tk.StringVar(value="0.75")
         self.test_center_auto_status_var = tk.StringVar(value="Auto random color: off")
-        self.test_letter_total_var = tk.StringVar(value="Letters pressed: 0")
-        self.test_letter_last_var = tk.StringVar(value="Last letter: none")
+        self.test_letter_total_var = tk.StringVar(value="Characters typed: 0")
+        self.test_letter_last_var = tk.StringVar(value="Last character: none")
         self.test_letter_breakdown_var = tk.StringVar(value="Breakdown: none")
         self.test_obstacle_counter_var = tk.StringVar(value="Obstacle interactions: 0")
         self.test_obstacle_last_var = tk.StringVar(value="Last obstacle action: none")
@@ -294,7 +330,6 @@ class AutoClickerApp:
         self._sync_action_controls()
         self._sync_hold_controls()
         self._sync_timing_controls()
-        self._set_color_options_visible(self.color_options_visible_var.get())
         self._sync_color_mode_controls()
         self._sync_safety_controls()
         self._sync_rule_controls()
@@ -334,17 +369,23 @@ class AutoClickerApp:
 
         click_tab = ttk.Frame(notebook, padding=10)
         color_tab = ttk.Frame(notebook, padding=10)
+        rules_tab = ttk.Frame(notebook, padding=10)
         safety_tab = ttk.Frame(notebook, padding=10)
+        macro_tab = ttk.Frame(notebook, padding=10)
         hotkey_profile_tab = ttk.Frame(notebook, padding=10)
 
         notebook.add(click_tab, text="Click")
         notebook.add(color_tab, text="Color Trigger")
+        notebook.add(rules_tab, text="Rules")
         notebook.add(safety_tab, text="Safety")
+        notebook.add(macro_tab, text="Macros")
         notebook.add(hotkey_profile_tab, text="Hotkeys & Profiles")
 
         self._build_click_tab(click_tab)
         self._build_color_tab(color_tab)
+        self._build_rules_tab(rules_tab)
         self._build_safety_tab(safety_tab)
+        self._build_macro_tab(macro_tab)
         self._build_hotkeys_profiles_tab(hotkey_profile_tab)
 
         controls = ttk.Frame(container)
@@ -364,6 +405,16 @@ class AutoClickerApp:
     def _build_click_tab(self, tab: ttk.Frame) -> None:
         action_frame = ttk.LabelFrame(tab, text="Input Action", padding=10)
         action_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self._attach_info_button(
+            action_frame,
+            "Input Action",
+            (
+                "Options in this section:\n"
+                "- Action type: choose 'mouse' to send mouse clicks or 'keyboard' to send key presses.\n"
+                "- Mouse button: only used when Action type is mouse; picks left/right/middle click.\n"
+                "- Keyboard key: only used when Action type is keyboard; accepts single chars and supported named keys."
+            ),
+        )
 
         ttk.Label(action_frame, text="Action type:").grid(row=0, column=0, sticky="w", pady=3)
         action_combo = ttk.Combobox(
@@ -394,6 +445,17 @@ class AutoClickerApp:
 
         behavior_frame = ttk.LabelFrame(tab, text="Behavior", padding=10)
         behavior_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self._attach_info_button(
+            behavior_frame,
+            "Behavior",
+            (
+                "Options in this section:\n"
+                "- Click style: 'tap' sends a quick click/keypress, 'hold' keeps it down for Hold duration.\n"
+                "- Hold duration (s): press time used only in hold mode.\n"
+                "- Burst count: number of actions in one cycle.\n"
+                "- Gap between burst actions (s): delay between each action inside a burst."
+            ),
+        )
 
         ttk.Label(behavior_frame, text="Click style:").grid(row=0, column=0, sticky="w", pady=3)
         click_style_combo = ttk.Combobox(
@@ -431,6 +493,20 @@ class AutoClickerApp:
 
         timing_frame = ttk.LabelFrame(tab, text="Timing", padding=10)
         timing_frame.grid(row=2, column=0, sticky="ew")
+        self._attach_info_button(
+            timing_frame,
+            "Timing",
+            (
+                "Options in this section:\n"
+                "- Base interval (s): main delay between cycles.\n"
+                "- Randomize interval: enables min/max range randomization each cycle.\n"
+                "- Random min/max (s): lower/upper bounds used when randomization is on.\n"
+                "- Enable anti-detection timing model: adds timing variance.\n"
+                "- Jitter (%): +/- percentage applied to the chosen interval.\n"
+                "- Micro-pause chance (%): probability of adding an extra pause.\n"
+                "- Max micro-pause (s): maximum added pause duration."
+            ),
+        )
 
         ttk.Label(timing_frame, text="Base interval (s):").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(timing_frame, textvariable=self.interval_var, width=16).grid(
@@ -472,81 +548,87 @@ class AutoClickerApp:
             row=7, column=1, sticky="w", pady=2
         )
 
-        macro_frame = ttk.LabelFrame(tab, text="Macro / Recording", padding=10)
-        macro_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-
-        ttk.Checkbutton(
-            macro_frame,
-            text="Use selected recording instead of single click action",
-            variable=self.use_macro_recording_var,
-        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=2)
-
-        ttk.Label(macro_frame, text="Selected recording:").grid(row=1, column=0, sticky="w", pady=3)
-        self.recording_combo = ttk.Combobox(
-            macro_frame,
-            textvariable=self.selected_recording_var,
-            values=[],
-            state="readonly",
-            width=28,
-        )
-        self.recording_combo.grid(row=1, column=1, sticky="w", pady=3)
-        ttk.Button(macro_frame, text="Play once", command=self._play_selected_recording_once).grid(
-            row=1, column=2, sticky="w", padx=(8, 0), pady=3
-        )
-        ttk.Button(macro_frame, text="Refresh", command=self._refresh_recording_list).grid(
-            row=1, column=3, sticky="w", padx=(6, 0), pady=3
-        )
-
-        ttk.Label(macro_frame, text="Macro speed multiplier:").grid(row=2, column=0, sticky="w", pady=3)
-        ttk.Entry(macro_frame, textvariable=self.macro_speed_var, width=16).grid(
-            row=2, column=1, sticky="w", pady=3
-        )
-
-        ttk.Label(macro_frame, text="Save recording as:").grid(row=3, column=0, sticky="w", pady=3)
-        ttk.Entry(macro_frame, textvariable=self.recording_name_var, width=30).grid(
-            row=3, column=1, sticky="w", pady=3
-        )
-        ttk.Button(macro_frame, text="Save temp as named", command=self._save_temp_recording_as_named).grid(
-            row=3, column=2, sticky="w", padx=(8, 0), pady=3
-        )
-        ttk.Button(macro_frame, text="Delete selected", command=self._delete_selected_recording).grid(
-            row=3, column=3, sticky="w", padx=(6, 0), pady=3
-        )
-        ttk.Button(macro_frame, text="Toggle recording now", command=self._toggle_recording_hotkey).grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(6, 0)
-        )
-
     def _build_color_tab(self, tab: ttk.Frame) -> None:
-        header_row = ttk.Frame(tab)
-        header_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+
+        outer = ttk.Frame(tab)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scroll.set)
+
+        content = ttk.Frame(canvas, padding=(0, 0, 4, 0))
+        content_id = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.columnconfigure(0, weight=1)
+
+        def _on_content_resize(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_resize(event: tk.Event) -> None:
+            canvas.itemconfigure(content_id, width=event.width)
+
+        def _on_mouse_wheel(event: tk.Event) -> None:
+            if event.delta == 0:
+                return
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        content.bind("<Configure>", _on_content_resize, add="+")
+        canvas.bind("<Configure>", _on_canvas_resize, add="+")
+        canvas.bind("<MouseWheel>", _on_mouse_wheel, add="+")
+        content.bind("<MouseWheel>", _on_mouse_wheel, add="+")
+
+        header_row = ttk.LabelFrame(content, text="Trigger", padding=10)
+        header_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header_row.columnconfigure(3, weight=1)
+        self._attach_info_button(
+            header_row,
+            "Color Trigger",
+            (
+                "Options in this section:\n"
+                "- Enable color trigger: gates action execution by color match result.\n"
+                "- When color matches:\n"
+                "  continuous = keep firing while the match stays true.\n"
+                "  single = fire once on transition from non-match to match."
+            ),
+        )
 
         ttk.Checkbutton(
             header_row,
             text="Enable color trigger",
             variable=self.use_color_check_var,
-        ).pack(side="left")
+        ).grid(row=0, column=0, sticky="w", pady=2)
 
-        ttk.Label(header_row, text="Rule logic:").pack(side="left", padx=(12, 4))
+        ttk.Label(header_row, text="When color matches:").grid(row=0, column=1, sticky="w", padx=(12, 4))
         ttk.Combobox(
             header_row,
-            textvariable=self.condition_logic_mode_var,
-            values=["and", "or"],
+            textvariable=self.color_trigger_mode_var,
+            values=["continuous", "single"],
             state="readonly",
-            width=6,
-        ).pack(side="left")
+            width=12,
+        ).grid(row=0, column=2, sticky="w")
 
-        self.color_toggle_button = ttk.Button(
-            header_row,
-            text="Show color options",
-            command=self._toggle_color_options,
+        self.color_options_frame = content
+
+        color_target_frame = ttk.LabelFrame(content, text="Target", padding=10)
+        color_target_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self._attach_info_button(
+            color_target_frame,
+            "Color Target",
+            (
+                "Options in this section:\n"
+                "- Target color (hex): exact color to detect (example: #A1B2C3).\n"
+                "- Start inkdropper: starts live hover sampling so you can capture a color.\n"
+                "- Preview: shows current target color and validation state.\n"
+                "- Tolerance (0-255): allowed RGB per-channel difference from target.\n"
+                "- Inkdrop lock key: key used to lock the currently hovered color while inkdropper is active."
+            ),
         )
-        self.color_toggle_button.pack(side="right")
-
-        self.color_options_frame = ttk.Frame(tab)
-        self.color_options_frame.grid(row=1, column=0, sticky="nsew")
-
-        color_target_frame = ttk.LabelFrame(self.color_options_frame, text="Target", padding=10)
-        color_target_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
         ttk.Label(color_target_frame, text="Target color (hex):").grid(
             row=0, column=0, sticky="w", pady=3
@@ -597,14 +679,23 @@ class AutoClickerApp:
             foreground="#4b5563",
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
-        ttk.Checkbutton(
-            color_target_frame,
-            text="Edge-trigger mode (fire only on non-match -> match transition)",
-            variable=self.edge_trigger_var,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
-
-        sample_frame = ttk.LabelFrame(self.color_options_frame, text="Sampling Source", padding=10)
-        sample_frame.grid(row=1, column=0, sticky="ew")
+        sample_frame = ttk.LabelFrame(content, text="Sampling Source", padding=10)
+        sample_frame.grid(row=2, column=0, sticky="ew")
+        self._attach_info_button(
+            sample_frame,
+            "Sampling Source",
+            (
+                "Options in this section:\n"
+                "- Sample mode:\n"
+                "  cursor = read the pixel under current cursor position.\n"
+                "  point = read one fixed coordinate.\n"
+                "  region = detect whether any pixel in a rectangle matches.\n"
+                "- Monitor: optional monitor boundary filter for multi-monitor setups.\n"
+                "- Point X / Y + Use cursor: set fixed point manually or from cursor.\n"
+                "- Region x1,y1,x2,y2: explicit rectangle bounds.\n"
+                "- Quick region size + Center at cursor: creates a square region centered on cursor."
+            ),
+        )
 
         ttk.Label(sample_frame, text="Sample mode:").grid(row=0, column=0, sticky="w", pady=3)
         sample_mode_combo = ttk.Combobox(
@@ -661,45 +752,18 @@ class AutoClickerApp:
         )
         region_cursor_btn.grid(row=5, column=3, sticky="w", pady=3, padx=(8, 0))
 
-        self.crosshair_button = ttk.Button(
-            sample_frame,
-            text="Show crosshair",
-            command=self._toggle_crosshair,
+        history_frame = ttk.LabelFrame(content, text="Pixel History", padding=10)
+        history_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self._attach_info_button(
+            history_frame,
+            "Pixel History",
+            (
+                "Options in this section:\n"
+                "- Enable history panel: turns recent sample logging on/off.\n"
+                "- List panel: shows recent sampled values and MATCH/MISS outcomes.\n"
+                "- Clear history: clears all currently shown history entries."
+            ),
         )
-        self.crosshair_button.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
-        window_rule_frame = ttk.LabelFrame(self.color_options_frame, text="Window Binding Rule", padding=10)
-        window_rule_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Checkbutton(
-            window_rule_frame,
-            text="Enable active-window title rule",
-            variable=self.window_binding_enabled_var,
-            command=self._sync_rule_controls,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
-        ttk.Label(window_rule_frame, text="Title contains:").grid(row=1, column=0, sticky="w", pady=3)
-        self.window_rule_entry = ttk.Entry(window_rule_frame, textvariable=self.window_title_rule_var, width=36)
-        self.window_rule_entry.grid(row=1, column=1, sticky="w", pady=3)
-        ttk.Button(window_rule_frame, text="Use current window", command=self._capture_current_window_title).grid(
-            row=1, column=2, sticky="w", padx=(8, 0), pady=3
-        )
-
-        time_rule_frame = ttk.LabelFrame(self.color_options_frame, text="Time Window Rule", padding=10)
-        time_rule_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        ttk.Checkbutton(
-            time_rule_frame,
-            text="Enable local time window",
-            variable=self.time_window_enabled_var,
-            command=self._sync_rule_controls,
-        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=2)
-        ttk.Label(time_rule_frame, text="Start HH:MM").grid(row=1, column=0, sticky="w", pady=3)
-        self.time_start_entry = ttk.Entry(time_rule_frame, textvariable=self.time_window_start_var, width=10)
-        self.time_start_entry.grid(row=1, column=1, sticky="w", pady=3)
-        ttk.Label(time_rule_frame, text="End HH:MM").grid(row=1, column=2, sticky="w", pady=3, padx=(12, 0))
-        self.time_end_entry = ttk.Entry(time_rule_frame, textvariable=self.time_window_end_var, width=10)
-        self.time_end_entry.grid(row=1, column=3, sticky="w", pady=3)
-
-        history_frame = ttk.LabelFrame(self.color_options_frame, text="Pixel History", padding=10)
-        history_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         ttk.Checkbutton(
             history_frame,
             text="Enable history panel",
@@ -722,9 +786,70 @@ class AutoClickerApp:
             region_cursor_btn,
         ]
 
+    def _build_rules_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+        window_rule_frame = ttk.LabelFrame(tab, text="Window Binding Rule", padding=10)
+        window_rule_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self._attach_info_button(
+            window_rule_frame,
+            "Window Binding Rule",
+            (
+                "Options in this section:\n"
+                "- Enable active-window title rule: requires foreground window title to match.\n"
+                "- Title contains: substring that must exist in active window title.\n"
+                "- Use current window: captures current foreground title into the rule field."
+            ),
+        )
+        ttk.Checkbutton(
+            window_rule_frame,
+            text="Enable active-window title rule",
+            variable=self.window_binding_enabled_var,
+            command=self._sync_rule_controls,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
+        ttk.Label(window_rule_frame, text="Title contains:").grid(row=1, column=0, sticky="w", pady=3)
+        self.window_rule_entry = ttk.Entry(window_rule_frame, textvariable=self.window_title_rule_var, width=36)
+        self.window_rule_entry.grid(row=1, column=1, sticky="w", pady=3)
+        ttk.Button(window_rule_frame, text="Use current window", command=self._capture_current_window_title).grid(
+            row=1, column=2, sticky="w", padx=(8, 0), pady=3
+        )
+
+        time_rule_frame = ttk.LabelFrame(tab, text="Time Window Rule", padding=10)
+        time_rule_frame.grid(row=1, column=0, sticky="ew")
+        self._attach_info_button(
+            time_rule_frame,
+            "Time Window Rule",
+            (
+                "Options in this section:\n"
+                "- Enable local time window: enforces time-based gating.\n"
+                "- Start HH:MM: local start time in 24-hour format.\n"
+                "- End HH:MM: local end time in 24-hour format.\n"
+                "- Overnight ranges are supported (for example 22:00 to 06:00)."
+            ),
+        )
+        ttk.Checkbutton(
+            time_rule_frame,
+            text="Enable local time window",
+            variable=self.time_window_enabled_var,
+            command=self._sync_rule_controls,
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=2)
+        ttk.Label(time_rule_frame, text="Start HH:MM").grid(row=1, column=0, sticky="w", pady=3)
+        self.time_start_entry = ttk.Entry(time_rule_frame, textvariable=self.time_window_start_var, width=10)
+        self.time_start_entry.grid(row=1, column=1, sticky="w", pady=3)
+        ttk.Label(time_rule_frame, text="End HH:MM").grid(row=1, column=2, sticky="w", pady=3, padx=(12, 0))
+        self.time_end_entry = ttk.Entry(time_rule_frame, textvariable=self.time_window_end_var, width=10)
+        self.time_end_entry.grid(row=1, column=3, sticky="w", pady=3)
+
     def _build_safety_tab(self, tab: ttk.Frame) -> None:
         timing_frame = ttk.LabelFrame(tab, text="Start Delay", padding=10)
         timing_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self._attach_info_button(
+            timing_frame,
+            "Start Delay",
+            (
+                "Options in this section:\n"
+                "- Delay before start (s): countdown before run begins after Start/Stop is pressed."
+            ),
+        )
 
         ttk.Label(timing_frame, text="Delay before start (s):").grid(
             row=0, column=0, sticky="w", pady=3
@@ -735,6 +860,16 @@ class AutoClickerApp:
 
         safety_frame = ttk.LabelFrame(tab, text="Safety Limits", padding=10)
         safety_frame.grid(row=1, column=0, sticky="ew")
+        self._attach_info_button(
+            safety_frame,
+            "Safety Limits",
+            (
+                "Options in this section:\n"
+                "- Stop after N actions: stops run once action counter reaches the configured value.\n"
+                "- Stop after N seconds: stops run after elapsed runtime limit.\n"
+                "- Limits can be used independently or together."
+            ),
+        )
 
         ttk.Checkbutton(
             safety_frame,
@@ -762,9 +897,242 @@ class AutoClickerApp:
             foreground="#4b5563",
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
+    def _build_macro_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+
+        control_frame = ttk.LabelFrame(tab, text="Macro Controls", padding=10)
+        control_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        control_frame.columnconfigure(1, weight=1)
+        self._attach_info_button(
+            control_frame,
+            "Macro Controls",
+            (
+                "Options in this section:\n"
+                "- Use selected recording instead of single click action: switches run mode to macro playback.\n"
+                "- Selected recording: chooses which saved recording is active.\n"
+                "- Play once: plays selected macro immediately once.\n"
+                "- Refresh: reloads recording list from in-memory state.\n"
+                "- Macro speed multiplier: playback timing scale (1.0 = recorded speed).\n"
+                "- Toggle recording now: starts/stops capture into temporary recording.\n"
+                "- Save recording as / Save temp as named: copies temporary recording to named slot.\n"
+                "- Delete selected: removes the selected recording."
+            ),
+        )
+
+        ttk.Checkbutton(
+            control_frame,
+            text="Use selected recording instead of single click action",
+            variable=self.use_macro_recording_var,
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=2)
+
+        ttk.Label(control_frame, text="Selected recording:").grid(row=1, column=0, sticky="w", pady=3)
+        self.recording_combo = ttk.Combobox(
+            control_frame,
+            textvariable=self.selected_recording_var,
+            values=[],
+            state="readonly",
+            width=32,
+        )
+        self.recording_combo.grid(row=1, column=1, sticky="ew", pady=3)
+        self.recording_combo.bind("<<ComboboxSelected>>", self._on_recording_selected, add="+")
+        ttk.Button(control_frame, text="Play once", command=self._play_selected_recording_once).grid(
+            row=1, column=2, sticky="w", padx=(8, 0), pady=3
+        )
+        ttk.Button(control_frame, text="Refresh", command=self._refresh_recording_list).grid(
+            row=1, column=3, sticky="w", padx=(6, 0), pady=3
+        )
+
+        ttk.Label(control_frame, text="Macro speed multiplier:").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Entry(control_frame, textvariable=self.macro_speed_var, width=16).grid(
+            row=2, column=1, sticky="w", pady=3
+        )
+        ttk.Button(control_frame, text="Toggle recording now", command=self._toggle_recording_hotkey).grid(
+            row=2, column=2, sticky="w", padx=(8, 0), pady=3
+        )
+
+        ttk.Label(control_frame, text="Save recording as:").grid(row=3, column=0, sticky="w", pady=3)
+        ttk.Entry(control_frame, textvariable=self.recording_name_var, width=34).grid(
+            row=3, column=1, sticky="w", pady=3
+        )
+        ttk.Button(control_frame, text="Save temp as named", command=self._save_temp_recording_as_named).grid(
+            row=3, column=2, sticky="w", padx=(8, 0), pady=3
+        )
+        ttk.Button(control_frame, text="Delete selected", command=self._delete_selected_recording).grid(
+            row=3, column=3, sticky="w", padx=(6, 0), pady=3
+        )
+
+        options_frame = ttk.LabelFrame(tab, text="Recording & Playback Options", padding=10)
+        options_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self._attach_info_button(
+            options_frame,
+            "Recording & Playback Options",
+            (
+                "Options in this section:\n"
+                "- Coordinate mode while recording:\n"
+                "  window_relative stores relative position to the anchored foreground window.\n"
+                "  absolute stores raw screen coordinates.\n"
+                "- Auto re-anchor playback to current foreground window: offsets/re-targets playback for moved windows.\n"
+                "- Visual dry-run: draws movement/click path without sending real input."
+            ),
+        )
+        ttk.Label(options_frame, text="Coordinate mode while recording:").grid(
+            row=0, column=0, sticky="w", pady=3
+        )
+        ttk.Combobox(
+            options_frame,
+            textvariable=self.recording_coordinate_mode_var,
+            values=["window_relative", "absolute"],
+            state="readonly",
+            width=18,
+        ).grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Checkbutton(
+            options_frame,
+            text="Auto re-anchor playback to current foreground window",
+            variable=self.macro_reanchor_window_var,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Checkbutton(
+            options_frame,
+            text="Visual dry-run (draw path/clicks, do not send inputs)",
+            variable=self.macro_dry_run_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=3)
+
+        editor_frame = ttk.LabelFrame(tab, text="Step Editor", padding=10)
+        editor_frame.grid(row=2, column=0, sticky="nsew")
+        tab.rowconfigure(2, weight=1)
+        editor_frame.columnconfigure(0, weight=1)
+        editor_frame.rowconfigure(0, weight=1)
+        self._attach_info_button(
+            editor_frame,
+            "Step Editor",
+            (
+                "Options in this section:\n"
+                "- Step table: index, per-step delay, type, and payload summary.\n"
+                "- Delay(s): time before this step relative to previous step.\n"
+                "- Type: event type (key/mouse move/click/scroll).\n"
+                "- Payload JSON: editable event data object for selected step.\n"
+                "- Apply Step Edit: validates and writes edits.\n"
+                "- Move Up/Move Down: reorders selected step.\n"
+                "- Delete Step: removes selected step and retimes remaining steps."
+            ),
+        )
+
+        self.macro_step_tree = ttk.Treeview(
+            editor_frame,
+            columns=("idx", "delay", "type", "summary"),
+            show="headings",
+            height=12,
+            selectmode="browse",
+        )
+        self.macro_step_tree.heading("idx", text="#")
+        self.macro_step_tree.heading("delay", text="Delay(s)")
+        self.macro_step_tree.heading("type", text="Type")
+        self.macro_step_tree.heading("summary", text="Payload")
+        self.macro_step_tree.column("idx", width=46, anchor="center")
+        self.macro_step_tree.column("delay", width=92, anchor="e")
+        self.macro_step_tree.column("type", width=110, anchor="w")
+        self.macro_step_tree.column("summary", width=440, anchor="w")
+        self.macro_step_tree.grid(row=0, column=0, sticky="nsew")
+        self.macro_step_tree.bind("<<TreeviewSelect>>", self._on_macro_step_selected, add="+")
+
+        tree_scroll = ttk.Scrollbar(editor_frame, orient="vertical", command=self.macro_step_tree.yview)
+        tree_scroll.grid(row=0, column=1, sticky="ns")
+        self.macro_step_tree.configure(yscrollcommand=tree_scroll.set)
+
+        edit_row = ttk.Frame(editor_frame)
+        edit_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        edit_row.columnconfigure(7, weight=1)
+
+        ttk.Label(edit_row, textvariable=self.macro_selected_step_var).grid(
+            row=0, column=0, columnspan=8, sticky="w", pady=(0, 4)
+        )
+        ttk.Label(edit_row, text="Delay(s):").grid(row=1, column=0, sticky="w")
+        ttk.Entry(edit_row, textvariable=self.macro_step_delay_var, width=10).grid(
+            row=1, column=1, sticky="w", padx=(4, 8)
+        )
+        ttk.Label(edit_row, text="Type:").grid(row=1, column=2, sticky="w")
+        ttk.Combobox(
+            edit_row,
+            textvariable=self.macro_step_type_var,
+            values=["key_press", "key_release", "mouse_move", "mouse_click", "mouse_scroll"],
+            state="readonly",
+            width=14,
+        ).grid(row=1, column=3, sticky="w", padx=(4, 8))
+        ttk.Label(edit_row, text="Payload JSON:").grid(row=1, column=4, sticky="w")
+        ttk.Entry(edit_row, textvariable=self.macro_step_payload_var, width=60).grid(
+            row=1, column=5, columnspan=3, sticky="ew", padx=(4, 8)
+        )
+
+        self.macro_step_apply_button = ttk.Button(
+            edit_row,
+            text="Apply Step Edit",
+            command=self._apply_macro_step_edit,
+        )
+        self.macro_step_apply_button.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(edit_row, text="Move Up", command=self._move_macro_step_up).grid(
+            row=2, column=1, sticky="w", pady=(6, 0), padx=(6, 0)
+        )
+        ttk.Button(edit_row, text="Move Down", command=self._move_macro_step_down).grid(
+            row=2, column=2, sticky="w", pady=(6, 0), padx=(6, 0)
+        )
+        ttk.Button(edit_row, text="Delete Step", command=self._delete_macro_step).grid(
+            row=2, column=3, sticky="w", pady=(6, 0), padx=(6, 0)
+        )
+
+    def _build_testing_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+
+        summary = ttk.LabelFrame(tab, text="Testing Windows", padding=10)
+        summary.grid(row=0, column=0, sticky="ew")
+        self._attach_info_button(
+            summary,
+            "Testing Windows",
+            (
+                "Options in this section:\n"
+                "- Open Click Targets Test: validates click precision and burst behavior.\n"
+                "- Open Color Wheel Test: validates color capture and matching workflows.\n"
+                "- Open Letter Counter Test: validates keyboard capture and key routing.\n"
+                "- Open Recording Obstacle Test: generates mixed events for macro recording validation."
+            ),
+        )
+        ttk.Label(
+            summary,
+            text=(
+                "Open a test window with dedicated tabs for click targets, inkdrop colors, "
+                "letter counting, and recording obstacles."
+            ),
+            foreground="#4b5563",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Button(summary, text="Open Click Targets Test", command=lambda: self._open_test_window("click")).grid(
+            row=1, column=0, sticky="w", pady=2
+        )
+        ttk.Button(summary, text="Open Color Wheel Test", command=lambda: self._open_test_window("color")).grid(
+            row=2, column=0, sticky="w", pady=2
+        )
+        ttk.Button(summary, text="Open Letter Counter Test", command=lambda: self._open_test_window("letters")).grid(
+            row=3, column=0, sticky="w", pady=2
+        )
+        ttk.Button(
+            summary,
+            text="Open Recording Obstacle Test",
+            command=lambda: self._open_test_window("obstacle"),
+        ).grid(row=4, column=0, sticky="w", pady=2)
+
     def _build_hotkeys_profiles_tab(self, tab: ttk.Frame) -> None:
         hotkey_frame = ttk.LabelFrame(tab, text="Hotkeys", padding=10)
         hotkey_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self._attach_info_button(
+            hotkey_frame,
+            "Hotkeys",
+            (
+                "Options in this section:\n"
+                "- Start/Stop hotkey: toggles full run state.\n"
+                "- Pause/Resume hotkey: pauses active run loop without stopping.\n"
+                "- Record toggle hotkey: starts/stops recording capture.\n"
+                "- Play recording hotkey: plays selected recording once.\n"
+                "- Apply hotkeys: rebinds listeners using current values."
+            ),
+        )
 
         ttk.Label(hotkey_frame, text="Start/Stop hotkey:").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(hotkey_frame, textvariable=self.start_stop_hotkey_var, width=16).grid(
@@ -792,6 +1160,19 @@ class AutoClickerApp:
 
         profile_frame = ttk.LabelFrame(tab, text="Profiles", padding=10)
         profile_frame.grid(row=1, column=0, sticky="ew")
+        self._attach_info_button(
+            profile_frame,
+            "Profiles",
+            (
+                "Options in this section:\n"
+                "- Profile dropdown: chooses saved profile snapshot.\n"
+                "- Load: applies selected profile values to UI and runtime settings.\n"
+                "- Delete: removes selected profile from disk.\n"
+                "- Save as + Save profile: writes current configuration to profile name.\n"
+                "- Refresh: reloads profile list.\n"
+                "- Apply profile-specific hotkeys when loading profile: controls whether hotkeys are rebound on load."
+            ),
+        )
 
         ttk.Label(profile_frame, text="Profile:").grid(row=0, column=0, sticky="w", pady=3)
         self.profile_combo = ttk.Combobox(
@@ -836,32 +1217,39 @@ class AutoClickerApp:
 
         testing_frame = ttk.LabelFrame(tab, text="Testing", padding=10)
         testing_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(
+        self._attach_info_button(
             testing_frame,
-            text="Open a standalone playground for clicks, inkdrop colors, keys, and recording.",
-            foreground="#4b5563",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+            "Testing",
+            (
+                "Options in this section:\n"
+                "- Open test window: opens the testing utility window with overview and dedicated test tabs."
+            ),
+        )
         ttk.Button(
             testing_frame,
             text="Open test window",
             command=self._open_test_window,
-        ).grid(row=1, column=0, sticky="w")
+        ).grid(row=0, column=0, sticky="w")
 
-    def _open_test_window(self) -> None:
+    def _open_test_window(self, initial_tab: str = "overview") -> None:
         if self.test_window is not None:
             try:
                 if self.test_window.winfo_exists():
+                    if self.test_notebook is not None and initial_tab in self.test_tab_frames:
+                        self.test_notebook.select(self.test_tab_frames[initial_tab])
                     self.test_window.deiconify()
                     self.test_window.lift()
                     self.test_window.focus_force()
                     return
             except tk.TclError:
                 self.test_window = None
+                self.test_notebook = None
+                self.test_tab_frames = {}
 
         window = tk.Toplevel(self.root)
         window.title("Autoclicker Testing Window")
-        window.geometry("960x780")
-        window.minsize(760, 560)
+        window.geometry("980x760")
+        window.minsize(780, 560)
         window.transient(self.root)
         window.protocol("WM_DELETE_WINDOW", self._close_test_window)
         window.bind("<KeyPress>", self._on_test_window_key_press, add="+")
@@ -869,84 +1257,163 @@ class AutoClickerApp:
 
         self._reset_test_window_state()
 
-        outer = ttk.Frame(window)
-        outer.pack(fill="both", expand=True)
-
-        scroll_canvas = tk.Canvas(outer, highlightthickness=0)
-        scroll_canvas.pack(side="left", fill="both", expand=True)
-        y_scroll = ttk.Scrollbar(outer, orient="vertical", command=scroll_canvas.yview)
-        y_scroll.pack(side="right", fill="y")
-        scroll_canvas.configure(yscrollcommand=y_scroll.set)
-
-        container = ttk.Frame(scroll_canvas, padding=12)
-        scroll_window_id = scroll_canvas.create_window((0, 0), window=container, anchor="nw")
-
-        def _on_content_resize(_event: tk.Event) -> None:
-            scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
-
-        def _on_canvas_resize(event: tk.Event) -> None:
-            scroll_canvas.itemconfigure(scroll_window_id, width=event.width)
-
-        def _on_mouse_wheel(event: tk.Event) -> None:
-            if event.delta == 0:
-                return
-            scroll_canvas.yview_scroll(int(-event.delta / 120), "units")
-
-        container.bind("<Configure>", _on_content_resize, add="+")
-        scroll_canvas.bind("<Configure>", _on_canvas_resize, add="+")
-        window.bind("<MouseWheel>", _on_mouse_wheel, add="+")
-
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
-        container.columnconfigure(1, weight=1)
-        container.rowconfigure(4, weight=1)
+        container.rowconfigure(2, weight=1)
 
         ttk.Label(
             container,
             text="Testing Playground",
             font=("Segoe UI", 13, "bold"),
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             container,
-            text="Use this window to verify clicking, inkdrop color checks, key counting, and recording behavior.",
+            text="Each test has its own tab so you can extend them independently.",
             foreground="#4b5563",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 10))
+        ).grid(row=1, column=0, sticky="w", pady=(2, 10))
 
-        click_frame = ttk.LabelFrame(container, text="Autoclick Button Targets", padding=10)
-        click_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        notebook = ttk.Notebook(container)
+        notebook.grid(row=2, column=0, sticky="nsew")
+        self.test_notebook = notebook
 
-        ttk.Button(
-            click_frame,
-            text="Test Button 1",
-            command=lambda: self._increment_test_button_counter(1),
-        ).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Label(click_frame, textvariable=self.test_button_one_var).grid(
-            row=0, column=1, sticky="w", pady=4
+        overview_tab = ttk.Frame(notebook, padding=10)
+        click_tab = ttk.Frame(notebook, padding=10)
+        color_tab = ttk.Frame(notebook, padding=10)
+        letters_tab = ttk.Frame(notebook, padding=10)
+        obstacle_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(overview_tab, text="Overview")
+        notebook.add(click_tab, text="Click Targets")
+        notebook.add(color_tab, text="Inkdrop Colors")
+        notebook.add(letters_tab, text="Letter Counter")
+        notebook.add(obstacle_tab, text="Recording Obstacles")
+        self.test_tab_frames = {
+            "overview": overview_tab,
+            "click": click_tab,
+            "color": color_tab,
+            "letters": letters_tab,
+            "obstacle": obstacle_tab,
+        }
+
+        self._build_test_overview_tab(overview_tab)
+        self._build_test_click_tab(click_tab)
+        self._build_test_color_tab(color_tab)
+        self._build_test_letter_tab(letters_tab)
+        self._build_test_obstacle_tab(obstacle_tab)
+
+        if initial_tab in self.test_tab_frames:
+            notebook.select(self.test_tab_frames[initial_tab])
+
+        self._set_status("Testing window opened")
+
+    def _build_test_overview_tab(self, tab: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(tab, text="Testing Overview", padding=10)
+        frame.pack(fill="both", expand=True)
+        self._attach_info_button(
+            frame,
+            "Testing Overview",
+            (
+                "Overview of test tabs:\n"
+                "- Click Targets: validates click routing and target counting.\n"
+                "- Inkdrop Colors: validates color picking and dynamic color targets.\n"
+                "- Letter Counter: validates keyboard capture/focus behavior.\n"
+                "- Recording Obstacles: validates recording/playback against varied UI events."
+            ),
         )
 
-        ttk.Button(
-            click_frame,
-            text="Test Button 2",
-            command=lambda: self._increment_test_button_counter(2),
-        ).grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Label(click_frame, textvariable=self.test_button_two_var).grid(
-            row=1, column=1, sticky="w", pady=4
+        ttk.Label(
+            frame,
+            text="Use the tabs below for targeted manual verification.",
+            font=("Segoe UI", 11, "bold"),
+        ).grid(row=1, column=0, sticky="w", pady=(4, 8))
+
+        descriptions = [
+            ("Click Targets", "Create and interact with configurable button targets for click-behavior tests."),
+            ("Inkdrop Colors", "Use a color wheel and dynamic target color changes for color-trigger testing."),
+            ("Letter Counter", "Type letters and verify key counting and focus-dependent keyboard capture."),
+            ("Recording Obstacles", "Generate diverse events (buttons, text, slider, combo, scroll) for macro tests."),
+        ]
+        row = 2
+        for title, desc in descriptions:
+            ttk.Label(frame, text=f"{title}:", font=("Segoe UI", 9, "bold")).grid(
+                row=row, column=0, sticky="w", pady=(2, 0)
+            )
+            ttk.Label(frame, text=desc, foreground="#374151").grid(row=row + 1, column=0, sticky="w", pady=(0, 4))
+            row += 2
+
+    def _build_test_click_tab(self, tab: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(tab, text="Autoclick Button Targets", padding=10)
+        frame.pack(fill="x", anchor="nw")
+        self._attach_info_button(
+            frame,
+            "Autoclick Button Targets",
+            (
+                "Options in this section:\n"
+                "- Increment mode:\n"
+                "  tap_to_increment = increment when button is clicked/released.\n"
+                "  hold_to_increment = increment only if held for at least Hold threshold.\n"
+                "- Hold threshold (s): required hold duration in hold mode.\n"
+                "- New button label + Add button: create additional click targets dynamically.\n"
+                "- Dynamic target rows: each target shows current count and responds using selected increment mode."
+            ),
+        )
+        ttk.Label(
+            frame,
+            text="Use these targets to validate single-click, burst behavior, and hold gating.",
+            foreground="#4b5563",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 6))
+
+        ttk.Label(frame, text="New button label:").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Entry(frame, textvariable=self.test_click_new_button_name_var, width=24).grid(
+            row=2, column=1, sticky="w", pady=3
+        )
+        ttk.Button(frame, text="Add button", command=self._add_test_click_target_from_ui).grid(
+            row=2, column=2, sticky="w", pady=3, padx=(10, 0)
         )
 
-        color_frame = ttk.LabelFrame(container, text="Inkdrop Color Wheel", padding=10)
-        color_frame.grid(row=2, column=1, sticky="nsew", pady=(0, 8))
+        targets_container = ttk.Frame(frame)
+        targets_container.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.test_click_buttons_container = targets_container
+        self._add_test_click_target("Test Button 1")
+        self._add_test_click_target("Test Button 2")
 
-        wheel_size = 240
+    def _build_test_color_tab(self, tab: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(tab, text="Inkdrop Color Wheel", padding=10)
+        frame.pack(anchor="nw")
+        self._attach_info_button(
+            frame,
+            "Inkdrop Color Wheel",
+            (
+                "Options in this section:\n"
+                "- Color wheel + center target: visual area for color capture testing.\n"
+                "- Center button: acts as fixed target; pressing it does not change color.\n"
+                "- Wheel lock hotkey + Toggle lock: toggles live wheel inkdropper mode.\n"
+                "  while enabled, center color follows hovered wheel color.\n"
+                "- Random interval (s): timing for automatic color changes.\n"
+                "- Start/Stop random colors: toggles auto color cycling.\n"
+                "- Status labels: show current color and click count."
+            ),
+        )
+        ttk.Label(
+            frame,
+            text="Use this target to validate inkdrop lock capture and color-trigger matching.",
+            foreground="#4b5563",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        wheel_size = 260
         self.test_color_wheel_image = self._create_test_color_wheel_image(wheel_size)
         wheel_canvas = tk.Canvas(
-            color_frame,
+            frame,
             width=wheel_size,
             height=wheel_size,
             bg="white",
             highlightthickness=1,
             highlightbackground="#d1d5db",
         )
-        wheel_canvas.grid(row=0, column=0, sticky="w")
+        wheel_canvas.grid(row=1, column=0, sticky="w")
         wheel_canvas.create_image(wheel_size // 2, wheel_size // 2, image=self.test_color_wheel_image)
+        self.test_color_wheel_canvas = wheel_canvas
+        self.test_color_wheel_size = wheel_size
 
         self.test_center_button = tk.Button(
             wheel_canvas,
@@ -959,95 +1426,115 @@ class AutoClickerApp:
         wheel_canvas.create_window(
             wheel_size // 2,
             wheel_size // 2,
-            width=120,
-            height=46,
+            width=130,
+            height=48,
             window=self.test_center_button,
         )
         self._apply_test_center_color()
 
-        ttk.Label(color_frame, textvariable=self.test_center_counter_var).grid(
-            row=1, column=0, sticky="w", pady=(6, 2)
+        lock_row = ttk.Frame(frame)
+        lock_row.grid(row=2, column=0, sticky="w", pady=(6, 2))
+        ttk.Label(lock_row, text="Wheel lock hotkey:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(lock_row, textvariable=self.test_color_wheel_lock_key_var, width=6).grid(
+            row=0, column=1, sticky="w", padx=(6, 10)
         )
-        ttk.Label(color_frame, textvariable=self.test_center_color_var).grid(
-            row=2, column=0, sticky="w"
+        ttk.Button(lock_row, text="Toggle lock", command=self._toggle_test_color_wheel_lock).grid(
+            row=0, column=2, sticky="w"
         )
-        auto_color_frame = ttk.Frame(color_frame)
-        auto_color_frame.grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(auto_color_frame, text="Random interval (s):").grid(
-            row=0, column=0, sticky="w"
+        ttk.Label(lock_row, textvariable=self.test_color_wheel_lock_status_var).grid(
+            row=0, column=3, sticky="w", padx=(10, 0)
         )
-        ttk.Entry(
-            auto_color_frame,
-            textvariable=self.test_center_random_interval_var,
-            width=8,
-        ).grid(row=0, column=1, sticky="w", padx=(6, 8))
+
+        ttk.Label(frame, textvariable=self.test_center_counter_var).grid(row=3, column=0, sticky="w", pady=(6, 2))
+        ttk.Label(frame, textvariable=self.test_center_color_var).grid(row=4, column=0, sticky="w")
+        auto_color_frame = ttk.Frame(frame)
+        auto_color_frame.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(auto_color_frame, text="Random interval (s):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(auto_color_frame, textvariable=self.test_center_random_interval_var, width=8).grid(
+            row=0, column=1, sticky="w", padx=(6, 8)
+        )
         self.test_center_auto_toggle_button = ttk.Button(
             auto_color_frame,
             command=self._toggle_test_center_auto_color,
             width=20,
         )
         self.test_center_auto_toggle_button.grid(row=0, column=2, sticky="w")
-        ttk.Label(color_frame, textvariable=self.test_center_auto_status_var).grid(
-            row=4, column=0, sticky="w", pady=(4, 0)
+        ttk.Label(frame, textvariable=self.test_center_auto_status_var).grid(
+            row=6, column=0, sticky="w", pady=(4, 0)
         )
         self._sync_test_center_auto_toggle_button()
 
-        letter_frame = ttk.LabelFrame(container, text="Letter Counter", padding=10)
-        letter_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-
+    def _build_test_letter_tab(self, tab: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(tab, text="Letter Counter", padding=10)
+        frame.pack(fill="x", anchor="nw")
+        self._attach_info_button(
+            frame,
+            "Letter Counter",
+            (
+                "Options in this section:\n"
+                "- Character stats labels: total typed chars, last char, and per-char breakdown.\n"
+                "- Counts include spaces, punctuation, digits, and case-sensitive letters.\n"
+                "- Type while this window is focused to validate keyboard event capture."
+            ),
+        )
         ttk.Label(
-            letter_frame,
-            text="Click into this window and type letters. Every A-Z keypress increments the counter.",
+            frame,
+            text="Click inside this window and type characters. Counts are case-sensitive.",
             foreground="#4b5563",
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        ttk.Label(letter_frame, textvariable=self.test_letter_total_var).grid(
-            row=1, column=0, sticky="w", pady=2
-        )
-        ttk.Label(letter_frame, textvariable=self.test_letter_last_var).grid(
-            row=1, column=1, sticky="w", pady=2
-        )
-        ttk.Label(letter_frame, textvariable=self.test_letter_breakdown_var).grid(
+        ttk.Label(frame, textvariable=self.test_letter_total_var).grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(frame, textvariable=self.test_letter_last_var).grid(row=1, column=1, sticky="w", pady=2)
+        ttk.Label(frame, textvariable=self.test_letter_breakdown_var).grid(
             row=2, column=0, columnspan=2, sticky="w", pady=(2, 0)
         )
 
-        obstacle_frame = ttk.LabelFrame(container, text="Recording Obstacle Course", padding=10)
-        obstacle_frame.grid(row=4, column=0, columnspan=2, sticky="nsew")
-        obstacle_frame.columnconfigure(0, weight=0)
-        obstacle_frame.columnconfigure(1, weight=0)
-        obstacle_frame.columnconfigure(2, weight=1)
-        obstacle_frame.rowconfigure(5, weight=1)
+    def _build_test_obstacle_tab(self, tab: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(tab, text="Recording Obstacle Course", padding=10)
+        frame.pack(fill="both", expand=True)
+        self._attach_info_button(
+            frame,
+            "Recording Obstacle Course",
+            (
+                "Options in this section:\n"
+                "- Buttons, entry, combobox, spinbox, checkbutton, slider, and text box create varied event types.\n"
+                "- Interaction counters show total obstacle actions and last action type.\n"
+                "- Use this tab to stress-test macro recording/playback payload diversity."
+            ),
+        )
+        frame.columnconfigure(0, weight=0)
+        frame.columnconfigure(1, weight=0)
+        frame.columnconfigure(2, weight=1)
+        frame.rowconfigure(5, weight=1)
 
         ttk.Label(
-            obstacle_frame,
+            frame,
             text="Interact with controls below to generate varied recording events.",
             foreground="#4b5563",
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
         ttk.Label(
-            obstacle_frame,
+            frame,
             textvariable=self.test_obstacle_counter_var,
             foreground="#1e3a8a",
         ).grid(row=1, column=0, columnspan=2, sticky="w")
-        ttk.Label(obstacle_frame, textvariable=self.test_obstacle_last_var).grid(
-            row=1, column=2, sticky="w"
-        )
+        ttk.Label(frame, textvariable=self.test_obstacle_last_var).grid(row=1, column=2, sticky="w")
 
         ttk.Button(
-            obstacle_frame,
+            frame,
             text="Obstacle Button A",
             command=lambda: self._increment_test_obstacle_counter("Button A"),
         ).grid(row=2, column=0, sticky="w", pady=(6, 2))
         ttk.Button(
-            obstacle_frame,
+            frame,
             text="Obstacle Button B",
             command=lambda: self._increment_test_obstacle_counter("Button B"),
         ).grid(row=2, column=1, sticky="w", pady=(6, 2), padx=(6, 0))
         ttk.Button(
-            obstacle_frame,
+            frame,
             text="Obstacle Button C",
             command=lambda: self._increment_test_obstacle_counter("Button C"),
         ).grid(row=2, column=2, sticky="w", pady=(6, 2), padx=(6, 0))
 
-        entry_one = ttk.Entry(obstacle_frame, width=26)
+        entry_one = ttk.Entry(frame, width=26)
         entry_one.grid(row=3, column=0, sticky="w", pady=(6, 2))
         entry_one.bind(
             "<KeyRelease>",
@@ -1056,7 +1543,7 @@ class AutoClickerApp:
         )
 
         combo = ttk.Combobox(
-            obstacle_frame,
+            frame,
             values=["option-1", "option-2", "option-3"],
             state="readonly",
             width=14,
@@ -1069,7 +1556,7 @@ class AutoClickerApp:
         )
 
         spinbox = tk.Spinbox(
-            obstacle_frame,
+            frame,
             from_=0,
             to=50,
             width=8,
@@ -1078,14 +1565,14 @@ class AutoClickerApp:
         spinbox.grid(row=3, column=2, sticky="w", pady=(6, 2), padx=(6, 0))
 
         ttk.Checkbutton(
-            obstacle_frame,
+            frame,
             text="Toggle checkpoint",
             variable=self.test_obstacle_toggle_var,
             command=lambda: self._increment_test_obstacle_counter("Checkbutton toggle"),
         ).grid(row=4, column=0, sticky="w", pady=(8, 2))
 
         slider = ttk.Scale(
-            obstacle_frame,
+            frame,
             from_=0,
             to=100,
             orient="horizontal",
@@ -1093,23 +1580,28 @@ class AutoClickerApp:
         )
         slider.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(6, 0), pady=(8, 2))
 
-        text_box = tk.Text(obstacle_frame, height=5, width=54)
+        text_box = tk.Text(frame, height=5, width=54)
         text_box.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
         text_box.bind(
             "<KeyRelease>",
             lambda _event: self._increment_test_obstacle_counter("Text edit"),
             add="+",
         )
-
         entry_one.focus_set()
-        self._set_status("Testing window opened")
 
     def _close_test_window(self) -> None:
         window = self.test_window
+        self._cancel_all_test_click_target_hold_jobs()
         self.test_window = None
+        self.test_notebook = None
+        self.test_tab_frames = {}
         self.test_center_button = None
         self.test_center_auto_toggle_button = None
         self.test_color_wheel_image = None
+        self.test_click_buttons_container = None
+        self.test_color_wheel_canvas = None
+        self.test_color_wheel_size = 0
+        self._stop_test_color_wheel_lock()
         self._cancel_test_center_auto_job()
         self.test_center_auto_color_enabled = False
 
@@ -1122,11 +1614,19 @@ class AutoClickerApp:
             pass
 
     def _reset_test_window_state(self) -> None:
+        self._cancel_all_test_click_target_hold_jobs()
         self.test_button_one_count = 0
         self.test_button_two_count = 0
+        self.test_click_targets = {}
+        self.test_click_target_next_id = 1
+        self.test_click_new_button_name_var.set("")
         self.test_center_click_count = 0
         self.test_center_current_color = "#1f7a8c"
         self.test_center_auto_color_enabled = False
+        self.test_color_wheel_pick_enabled = False
+        self._cancel_test_color_wheel_pick_job()
+        self.test_color_wheel_lock_key_var.set("l")
+        self.test_color_wheel_lock_status_var.set("Wheel lock: off")
         self._cancel_test_center_auto_job()
         self.test_letter_total_count = 0
         self.test_letter_counts.clear()
@@ -1135,24 +1635,222 @@ class AutoClickerApp:
 
         self.test_button_one_var.set("Button 1 clicks: 0")
         self.test_button_two_var.set("Button 2 clicks: 0")
-        self.test_center_counter_var.set("Center button clicks: 0")
+        self.test_center_counter_var.set("Center button presses: 0")
         self.test_center_color_var.set("Current center color: #1F7A8C")
         self.test_center_random_interval_var.set("0.75")
         self.test_center_auto_status_var.set("Auto random color: off")
-        self.test_letter_total_var.set("Letters pressed: 0")
-        self.test_letter_last_var.set("Last letter: none")
+        self.test_letter_total_var.set("Characters typed: 0")
+        self.test_letter_last_var.set("Last character: none")
         self.test_letter_breakdown_var.set("Breakdown: none")
         self.test_obstacle_counter_var.set("Obstacle interactions: 0")
         self.test_obstacle_last_var.set("Last obstacle action: none")
 
     def _increment_test_button_counter(self, button_index: int) -> None:
-        if button_index == 1:
-            self.test_button_one_count += 1
-            self.test_button_one_var.set(f"Button 1 clicks: {self.test_button_one_count}")
+        target = self.test_click_targets.get(button_index)
+        if target is None:
+            return
+        count = int(target.get("count", 0)) + 1
+        target["count"] = count
+        counter_var = target.get("counter_var")
+        if isinstance(counter_var, tk.StringVar):
+            counter_var.set(f"Clicks: {count}")
+
+    @staticmethod
+    def _parse_target_hold_seconds(target: dict[str, object]) -> float | None:
+        hold_var = target.get("hold_seconds_var")
+        if not isinstance(hold_var, tk.StringVar):
+            return None
+        try:
+            seconds = float(hold_var.get().strip())
+        except ValueError:
+            return None
+        if seconds < 0:
+            return None
+        return seconds
+
+    def _refresh_test_click_targets_ui(self) -> None:
+        if self.test_click_buttons_container is None:
             return
 
-        self.test_button_two_count += 1
-        self.test_button_two_var.set(f"Button 2 clicks: {self.test_button_two_count}")
+        for child in self.test_click_buttons_container.winfo_children():
+            child.destroy()
+
+        for row, target_id in enumerate(sorted(self.test_click_targets.keys())):
+            target = self.test_click_targets[target_id]
+            label = str(target.get("label", f"Test Button {target_id}"))
+            button = tk.Button(
+                self.test_click_buttons_container,
+                text=label,
+                relief="raised",
+                font=("Segoe UI", 9),
+                bd=1,
+                padx=10,
+            )
+            button.grid(row=row, column=0, sticky="w", pady=4)
+            button.bind(
+                "<ButtonPress-1>",
+                lambda _event, tid=target_id: self._on_test_click_target_press(tid),
+                add="+",
+            )
+            button.bind(
+                "<ButtonRelease-1>",
+                lambda _event, tid=target_id: self._on_test_click_target_release(tid),
+                add="+",
+            )
+            counter_var = target.get("counter_var")
+            if isinstance(counter_var, tk.StringVar):
+                ttk.Label(self.test_click_buttons_container, textvariable=counter_var).grid(
+                    row=row, column=1, sticky="w", padx=(8, 0), pady=4
+                )
+
+            options = ttk.Frame(self.test_click_buttons_container)
+            options.grid(row=row, column=2, sticky="w", padx=(12, 0), pady=4)
+            ttk.Label(options, text="Mode:").grid(row=0, column=0, sticky="w")
+            mode_var = target.get("mode_var")
+            if not isinstance(mode_var, tk.StringVar):
+                mode_var = tk.StringVar(value="tap_to_increment")
+                target["mode_var"] = mode_var
+            mode_combo = ttk.Combobox(
+                options,
+                textvariable=mode_var,
+                values=["tap_to_increment", "hold_to_increment"],
+                state="readonly",
+                width=18,
+            )
+            mode_combo.grid(row=0, column=1, sticky="w", padx=(4, 8))
+            mode_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _event, tid=target_id: self._on_test_click_target_mode_changed(tid),
+                add="+",
+            )
+
+            hold_label = ttk.Label(options, text="Hold threshold (s):")
+            hold_entry_var = target.get("hold_seconds_var")
+            if not isinstance(hold_entry_var, tk.StringVar):
+                hold_entry_var = tk.StringVar(value="0.60")
+                target["hold_seconds_var"] = hold_entry_var
+            hold_entry = ttk.Entry(options, textvariable=hold_entry_var, width=8)
+            target["hold_label_widget"] = hold_label
+            target["hold_entry_widget"] = hold_entry
+            self._sync_test_click_target_mode_widgets(target_id)
+
+    def _add_test_click_target(self, label: str | None = None) -> None:
+        target_id = self.test_click_target_next_id
+        self.test_click_target_next_id += 1
+        target_label = (label or f"Test Button {target_id}").strip()
+        if not target_label:
+            target_label = f"Test Button {target_id}"
+        self.test_click_targets[target_id] = {
+            "label": target_label,
+            "count": 0,
+            "pressed_at": 0.0,
+            "pressed": False,
+            "hold_after_id": None,
+            "mode_var": tk.StringVar(value="tap_to_increment"),
+            "hold_seconds_var": tk.StringVar(value="0.60"),
+            "counter_var": tk.StringVar(value="Clicks: 0"),
+        }
+        self._refresh_test_click_targets_ui()
+
+    def _add_test_click_target_from_ui(self) -> None:
+        label = self.test_click_new_button_name_var.get().strip()
+        self._add_test_click_target(label if label else None)
+        self.test_click_new_button_name_var.set("")
+
+    def _on_test_click_target_press(self, target_id: int) -> None:
+        target = self.test_click_targets.get(target_id)
+        if target is None:
+            return
+        target["pressed_at"] = time.monotonic()
+        target["pressed"] = True
+        mode_var = target.get("mode_var")
+        mode = mode_var.get().strip().lower() if isinstance(mode_var, tk.StringVar) else "tap_to_increment"
+        if mode == "hold_to_increment":
+            self._start_test_click_target_hold_cycle(target_id)
+
+    def _on_test_click_target_release(self, target_id: int) -> None:
+        target = self.test_click_targets.get(target_id)
+        if target is None:
+            return
+
+        target["pressed"] = False
+        self._cancel_test_click_target_hold_job(target_id)
+        mode_var = target.get("mode_var")
+        mode = mode_var.get().strip().lower() if isinstance(mode_var, tk.StringVar) else "tap_to_increment"
+        if mode == "tap_to_increment":
+            self._increment_test_button_counter(target_id)
+
+    def _on_test_click_target_mode_changed(self, target_id: int) -> None:
+        self._sync_test_click_target_mode_widgets(target_id)
+        target = self.test_click_targets.get(target_id)
+        if target is None:
+            return
+        mode_var = target.get("mode_var")
+        mode = mode_var.get().strip().lower() if isinstance(mode_var, tk.StringVar) else "tap_to_increment"
+        if mode != "hold_to_increment":
+            self._cancel_test_click_target_hold_job(target_id)
+
+    def _sync_test_click_target_mode_widgets(self, target_id: int) -> None:
+        target = self.test_click_targets.get(target_id)
+        if target is None:
+            return
+        hold_label = target.get("hold_label_widget")
+        hold_entry = target.get("hold_entry_widget")
+        mode_var = target.get("mode_var")
+        if not isinstance(hold_label, ttk.Label) or not isinstance(hold_entry, ttk.Entry):
+            return
+        mode = mode_var.get().strip().lower() if isinstance(mode_var, tk.StringVar) else "tap_to_increment"
+        if mode == "hold_to_increment":
+            hold_label.grid(row=0, column=2, sticky="w")
+            hold_entry.grid(row=0, column=3, sticky="w", padx=(4, 0))
+        else:
+            hold_label.grid_remove()
+            hold_entry.grid_remove()
+
+    def _start_test_click_target_hold_cycle(self, target_id: int) -> None:
+        target = self.test_click_targets.get(target_id)
+        if target is None:
+            return
+        hold_seconds = self._parse_target_hold_seconds(target)
+        if hold_seconds is None:
+            self._set_status("Hold threshold must be a valid non-negative number.")
+            return
+        self._cancel_test_click_target_hold_job(target_id)
+        delay_ms = max(1, int(hold_seconds * 1000))
+        target["hold_after_id"] = self.root.after(
+            delay_ms,
+            lambda tid=target_id: self._on_test_click_target_hold_tick(tid),
+        )
+
+    def _on_test_click_target_hold_tick(self, target_id: int) -> None:
+        target = self.test_click_targets.get(target_id)
+        if target is None:
+            return
+        target["hold_after_id"] = None
+        if not bool(target.get("pressed", False)):
+            return
+        mode_var = target.get("mode_var")
+        mode = mode_var.get().strip().lower() if isinstance(mode_var, tk.StringVar) else "tap_to_increment"
+        if mode != "hold_to_increment":
+            return
+        self._increment_test_button_counter(target_id)
+        self._start_test_click_target_hold_cycle(target_id)
+
+    def _cancel_test_click_target_hold_job(self, target_id: int) -> None:
+        target = self.test_click_targets.get(target_id)
+        if target is None:
+            return
+        after_id = target.get("hold_after_id")
+        if isinstance(after_id, str):
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        target["hold_after_id"] = None
+
+    def _cancel_all_test_click_target_hold_jobs(self) -> None:
+        for target_id in list(self.test_click_targets.keys()):
+            self._cancel_test_click_target_hold_job(target_id)
 
     def _create_test_color_wheel_image(self, size: int) -> ImageTk.PhotoImage:
         image = Image.new("RGB", (size, size), (255, 255, 255))
@@ -1182,7 +1880,7 @@ class AutoClickerApp:
 
     def _cycle_test_center_color(self) -> None:
         self.test_center_click_count += 1
-        self.test_center_current_color = self._generate_random_test_color()
+        self._set_status("Center target pressed")
         self._apply_test_center_color()
 
     def _apply_test_center_color(self) -> None:
@@ -1191,14 +1889,14 @@ class AutoClickerApp:
         text_color = "black" if luminance > 150 else "white"
         if self.test_center_button is not None:
             self.test_center_button.configure(
-                text=f"Random Color\n{self.test_center_click_count} clicks",
+                text=f"Center Target\n{self.test_center_click_count} presses",
                 bg=color,
                 activebackground=color,
                 fg=text_color,
                 activeforeground=text_color,
             )
 
-        self.test_center_counter_var.set(f"Center button clicks: {self.test_center_click_count}")
+        self.test_center_counter_var.set(f"Center button presses: {self.test_center_click_count}")
         self.test_center_color_var.set(f"Current center color: {color.upper()}")
 
     def _generate_random_test_color(self) -> str:
@@ -1276,22 +1974,140 @@ class AutoClickerApp:
             pass
         self.test_center_auto_after_id = None
 
-    def _on_test_window_key_press(self, event: tk.Event) -> None:
+    def _toggle_test_color_wheel_lock(self) -> None:
+        if self.test_color_wheel_pick_enabled:
+            self._stop_test_color_wheel_lock()
+            return
+        self._start_test_color_wheel_lock()
+
+    def _start_test_color_wheel_lock(self) -> None:
+        hotkey = self.test_color_wheel_lock_key_var.get().strip().lower()
+        if len(hotkey) != 1:
+            self._set_status("Wheel lock hotkey must be a single key.")
+            return
+        self.test_color_wheel_pick_enabled = True
+        self.test_color_wheel_lock_status_var.set(f"Wheel lock: on (press {hotkey} to lock/stop)")
+        self._set_status("Wheel lock enabled")
+        self._run_test_color_wheel_pick()
+
+    def _stop_test_color_wheel_lock(self) -> None:
+        self.test_color_wheel_pick_enabled = False
+        self._cancel_test_color_wheel_pick_job()
+        self.test_color_wheel_lock_status_var.set("Wheel lock: off")
+
+    def _cancel_test_color_wheel_pick_job(self) -> None:
+        if self.test_color_wheel_pick_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.test_color_wheel_pick_after_id)
+        except tk.TclError:
+            pass
+        self.test_color_wheel_pick_after_id = None
+
+    def _run_test_color_wheel_pick(self) -> None:
+        self.test_color_wheel_pick_after_id = None
+        if not self.test_color_wheel_pick_enabled:
+            return
+        picked = self._pick_color_from_test_wheel_under_cursor()
+        if picked is not None:
+            self.test_center_current_color = picked
+            self._apply_test_center_color()
+        try:
+            self.test_color_wheel_pick_after_id = self.root.after(60, self._run_test_color_wheel_pick)
+        except tk.TclError:
+            self.test_color_wheel_pick_after_id = None
+
+    def _pick_color_from_test_wheel_under_cursor(self) -> str | None:
+        canvas = self.test_color_wheel_canvas
+        if canvas is None or self.test_color_wheel_size <= 0:
+            return None
+        try:
+            if not canvas.winfo_exists():
+                return None
+        except tk.TclError:
+            return None
+
+        x_root = self.root.winfo_pointerx()
+        y_root = self.root.winfo_pointery()
+        local_x = x_root - canvas.winfo_rootx()
+        local_y = y_root - canvas.winfo_rooty()
+        size = self.test_color_wheel_size
+        if local_x < 0 or local_y < 0 or local_x >= size or local_y >= size:
+            return None
+
+        rgb = self._test_color_wheel_rgb_at(local_x, local_y, size)
+        if rgb is None:
+            return None
+        return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+    @staticmethod
+    def _test_color_wheel_rgb_at(x: int, y: int, size: int) -> tuple[int, int, int] | None:
+        center = (size - 1) / 2.0
+        dx = x - center
+        dy = y - center
+        distance = math.hypot(dx, dy)
+        outer_radius = center - 1
+        inner_radius = outer_radius * 0.33
+        if distance > outer_radius or distance < inner_radius:
+            return None
+
+        hue = ((math.degrees(math.atan2(dy, dx)) + 360.0) % 360.0) / 360.0
+        saturation = min(1.0, max(0.0, distance / outer_radius))
+        red, green, blue = colorsys.hsv_to_rgb(hue, saturation, 1.0)
+        return int(red * 255), int(green * 255), int(blue * 255)
+
+    @staticmethod
+    def _display_typed_char(char: str) -> str:
+        if char == " ":
+            return "<space>"
+        if char == "\t":
+            return "<tab>"
+        if char == "\n":
+            return "<newline>"
+        if char == "\r":
+            return "<return>"
+        return char
+
+    def _update_test_character_breakdown(self) -> None:
+        if not self.test_letter_counts:
+            self.test_letter_breakdown_var.set("Breakdown: none")
+            return
+
+        breakdown = ", ".join(
+            f"{self._display_typed_char(token)}:{count}"
+            for token, count in sorted(self.test_letter_counts.items(), key=lambda item: item[0])
+        )
+        self.test_letter_breakdown_var.set(f"Breakdown: {breakdown}")
+
+    def _on_test_window_key_press(self, event: tk.Event) -> str | None:
         char = event.char
         if not char or len(char) != 1:
             return
-        if not char.isalpha():
-            return
+        current_tab_name = ""
+        if self.test_notebook is not None:
+            try:
+                selected_id = self.test_notebook.select()
+                for name, frame in self.test_tab_frames.items():
+                    if str(frame) == str(selected_id):
+                        current_tab_name = name
+                        break
+            except tk.TclError:
+                current_tab_name = ""
 
-        letter = char.lower()
-        self.test_letter_total_count += 1
-        self.test_letter_counts[letter] = self.test_letter_counts.get(letter, 0) + 1
-        self.test_letter_total_var.set(f"Letters pressed: {self.test_letter_total_count}")
-        self.test_letter_last_var.set(f"Last letter: {letter.upper()}")
-
-        top_letters = sorted(self.test_letter_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
-        breakdown = ", ".join(f"{token.upper()}:{count}" for token, count in top_letters)
-        self.test_letter_breakdown_var.set(f"Breakdown: {breakdown or 'none'}")
+        if (
+            current_tab_name == "color"
+            and char.lower() == self.test_color_wheel_lock_key_var.get().strip().lower()
+        ):
+            self._toggle_test_color_wheel_lock()
+            return "break"
+        if current_tab_name == "letters" and char.isprintable():
+            self.test_letter_total_count += 1
+            self.test_letter_counts[char] = self.test_letter_counts.get(char, 0) + 1
+            self.test_letter_total_var.set(f"Characters typed: {self.test_letter_total_count}")
+            self.test_letter_last_var.set(f"Last character: {self._display_typed_char(char)}")
+            self._update_test_character_breakdown()
+            return "break"
+        return None
 
     def _increment_test_obstacle_counter(self, action_name: str) -> None:
         self.test_obstacle_count += 1
@@ -1322,6 +2138,25 @@ class AutoClickerApp:
 
         try:
             self.root.after(0, lambda value=text: self.session_info_var.set(value))
+        except tk.TclError:
+            pass
+
+    def _show_section_info(self, title: str, text: str) -> None:
+        try:
+            messagebox.showinfo(title, text, parent=self.root)
+        except tk.TclError:
+            self._set_status(text)
+
+    def _attach_info_button(self, frame: ttk.LabelFrame, title: str, text: str) -> None:
+        frame.columnconfigure(998, weight=1)
+        button = ttk.Button(
+            frame,
+            text="Info",
+            command=lambda t=title, body=text: self._show_section_info(t, body),
+        )
+        button.grid(row=0, column=999, sticky="e", padx=(8, 4), pady=(0, 4))
+        try:
+            button.configure(takefocus=False)
         except tk.TclError:
             pass
 
@@ -1587,6 +2422,43 @@ class AutoClickerApp:
         except Exception:
             return ""
 
+    @staticmethod
+    def _foreground_window_info() -> tuple[str, Rect | None]:
+        if sys.platform != "win32":
+            return "", None
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return "", None
+
+            title_length = user32.GetWindowTextLengthW(hwnd)
+            title = ""
+            if title_length > 0:
+                buffer = ctypes.create_unicode_buffer(title_length + 1)
+                user32.GetWindowTextW(hwnd, buffer, title_length + 1)
+                title = buffer.value.strip()
+
+            rect = RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return title, None
+
+            window_rect = (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+            if window_rect[2] <= window_rect[0] or window_rect[3] <= window_rect[1]:
+                return title, None
+            return title, window_rect
+        except Exception:
+            return "", None
+
     def _capture_current_window_title(self) -> None:
         title = self._current_window_title()
         if not title:
@@ -1664,6 +2536,87 @@ class AutoClickerApp:
 
         normalized.sort(key=lambda item: float(item["t"]))
         return normalized
+
+    @staticmethod
+    def _default_recording_meta() -> dict[str, object]:
+        return {
+            "coordinate_mode": "absolute",
+            "anchor_title": "",
+            "anchor_rect": None,
+            "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+
+    @staticmethod
+    def _normalize_anchor_rect(raw_rect: object) -> Rect | None:
+        if not isinstance(raw_rect, (list, tuple)) or len(raw_rect) != 4:
+            return None
+        try:
+            x1, y1, x2, y2 = (int(raw_rect[0]), int(raw_rect[1]), int(raw_rect[2]), int(raw_rect[3]))
+        except (TypeError, ValueError):
+            return None
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return x1, y1, x2, y2
+
+    def _normalize_recording_meta(self, raw_meta: object) -> dict[str, object]:
+        meta = self._default_recording_meta()
+        if not isinstance(raw_meta, dict):
+            return meta
+
+        coordinate_mode = str(raw_meta.get("coordinate_mode", "")).strip().lower()
+        if coordinate_mode in {"absolute", "window_relative"}:
+            meta["coordinate_mode"] = coordinate_mode
+
+        anchor_title = raw_meta.get("anchor_title")
+        if isinstance(anchor_title, str):
+            meta["anchor_title"] = anchor_title
+
+        normalized_rect = self._normalize_anchor_rect(raw_meta.get("anchor_rect"))
+        if normalized_rect is not None:
+            meta["anchor_rect"] = list(normalized_rect)
+
+        created_at = raw_meta.get("created_at")
+        if isinstance(created_at, str) and created_at:
+            meta["created_at"] = created_at
+
+        return meta
+
+    def _normalize_recording_package(self, raw: object) -> dict[str, object] | None:
+        if isinstance(raw, list):
+            return {
+                "events": self._normalize_recording_events(raw),
+                "meta": self._default_recording_meta(),
+            }
+
+        if not isinstance(raw, dict):
+            return None
+
+        raw_events = raw.get("events")
+        if not isinstance(raw_events, list):
+            return None
+
+        return {
+            "events": self._normalize_recording_events(raw_events),
+            "meta": self._normalize_recording_meta(raw.get("meta")),
+        }
+
+    @staticmethod
+    def _recording_events(package: dict[str, object] | None) -> list[dict[str, object]]:
+        if not isinstance(package, dict):
+            return []
+        events = package.get("events")
+        if isinstance(events, list):
+            return events
+        return []
+
+    @staticmethod
+    def _recording_meta(package: dict[str, object] | None) -> dict[str, object]:
+        if not isinstance(package, dict):
+            return {}
+        meta = package.get("meta")
+        if isinstance(meta, dict):
+            return meta
+        return {}
 
     @staticmethod
     def _parse_keyboard_key(raw_key: str) -> keyboard.Key | keyboard.KeyCode | None:
@@ -1878,7 +2831,7 @@ class AutoClickerApp:
         if isinstance(key, keyboard.KeyCode):
             if key.char is None:
                 return None
-            return key.char.lower()
+            return key.char
 
         if isinstance(key, keyboard.Key):
             return key.name.lower() if key.name else None
@@ -1907,7 +2860,7 @@ class AutoClickerApp:
                 continue
             token = self._key_to_token(parsed)
             if token:
-                tokens.add(token)
+                tokens.add(token.lower())
         return tokens
 
     def _on_recording_key_press(self, key: keyboard.Key | keyboard.KeyCode) -> None:
@@ -1915,7 +2868,7 @@ class AutoClickerApp:
         if token is None:
             return
 
-        if token in self._control_hotkey_tokens():
+        if token.lower() in self._control_hotkey_tokens():
             return
 
         self._record_event("key_press", {"key": token})
@@ -1925,10 +2878,26 @@ class AutoClickerApp:
         if token is None:
             return
 
-        if token in self._control_hotkey_tokens():
+        if token.lower() in self._control_hotkey_tokens():
             return
 
         self._record_event("key_release", {"key": token})
+
+    def _recording_coordinate_mode(self) -> str:
+        mode = self.recording_coordinate_mode_var.get().strip().lower()
+        if mode in {"absolute", "window_relative"}:
+            return mode
+        return "absolute"
+
+    def _recorded_point_payload(self, x: int, y: int, extra: dict[str, object] | None = None) -> dict[str, object]:
+        payload: dict[str, object] = {"x": int(x), "y": int(y)}
+        if extra:
+            payload.update(extra)
+
+        if self._recording_coordinate_mode() == "window_relative" and self.recording_anchor_rect is not None:
+            payload["rx"] = int(x - self.recording_anchor_rect[0])
+            payload["ry"] = int(y - self.recording_anchor_rect[1])
+        return payload
 
     def _on_recording_mouse_move(self, x: float, y: float) -> None:
         now = time.monotonic()
@@ -1938,7 +2907,7 @@ class AutoClickerApp:
 
         self.recording_last_move_pos = point
         self.recording_last_move_time = now
-        self._record_event("mouse_move", {"x": point[0], "y": point[1]})
+        self._record_event("mouse_move", self._recorded_point_payload(point[0], point[1]))
 
     def _on_recording_mouse_click(
         self,
@@ -1950,12 +2919,11 @@ class AutoClickerApp:
         token = self._button_to_token(button)
         self._record_event(
             "mouse_click",
-            {
-                "x": int(x),
-                "y": int(y),
-                "button": token,
-                "pressed": bool(pressed),
-            },
+            self._recorded_point_payload(
+                int(x),
+                int(y),
+                {"button": token, "pressed": bool(pressed)},
+            ),
         )
 
     def _on_recording_mouse_scroll(
@@ -1967,12 +2935,11 @@ class AutoClickerApp:
     ) -> None:
         self._record_event(
             "mouse_scroll",
-            {
-                "x": int(x),
-                "y": int(y),
-                "dx": float(dx),
-                "dy": float(dy),
-            },
+            self._recorded_point_payload(
+                int(x),
+                int(y),
+                {"dx": float(dx), "dy": float(dy)},
+            ),
         )
 
     def _start_recording_capture(self) -> bool:
@@ -1983,6 +2950,7 @@ class AutoClickerApp:
         self.recording_started_at = time.monotonic()
         self.recording_last_move_time = 0.0
         self.recording_last_move_pos = None
+        self.recording_anchor_title, self.recording_anchor_rect = self._foreground_window_info()
 
         try:
             self.recording_keyboard_listener = keyboard.Listener(
@@ -1997,7 +2965,17 @@ class AutoClickerApp:
             self.recording_keyboard_listener.start()
             self.recording_mouse_listener.start()
             self.recording_active = True
-            self._set_status("Recording started. Press record hotkey again to stop/save temporary.")
+            mode = self._recording_coordinate_mode()
+            if mode == "window_relative" and self.recording_anchor_rect is not None:
+                self._set_status(
+                    "Recording started (window-relative). Press record hotkey again to stop/save temporary."
+                )
+            elif mode == "window_relative":
+                self._set_status(
+                    "Recording started (window-relative requested, no window anchor available)."
+                )
+            else:
+                self._set_status("Recording started. Press record hotkey again to stop/save temporary.")
             return True
         except Exception as exc:
             self.recording_keyboard_listener = None
@@ -2027,11 +3005,23 @@ class AutoClickerApp:
             )
         return serialized
 
+    def _current_recording_package(self) -> dict[str, object]:
+        meta = self._default_recording_meta()
+        meta["coordinate_mode"] = self._recording_coordinate_mode()
+        meta["anchor_title"] = self.recording_anchor_title
+        if self.recording_anchor_rect is not None:
+            meta["anchor_rect"] = list(self.recording_anchor_rect)
+        return {
+            "events": self._serialize_recording_events(),
+            "meta": meta,
+        }
+
     def _toggle_recording_hotkey(self) -> None:
         if self.recording_active:
             self._stop_recording_capture()
-            serialized = self._serialize_recording_events()
-            self.recordings[TEMP_RECORDING_NAME] = serialized
+            package = self._current_recording_package()
+            serialized = self._recording_events(package)
+            self.recordings[TEMP_RECORDING_NAME] = package
             self.selected_recording_var.set(TEMP_RECORDING_NAME)
             self._save_recordings_to_disk()
             self._refresh_recording_list()
@@ -2047,11 +3037,15 @@ class AutoClickerApp:
             return
 
         temp = self.recordings.get(TEMP_RECORDING_NAME)
-        if not temp:
+        if temp is None:
+            self._set_status("No temporary recording available")
+            return
+        temp_events = self._recording_events(temp)
+        if not temp_events:
             self._set_status("No temporary recording available")
             return
 
-        self.recordings[name] = [dict(item) for item in temp]
+        self.recordings[name] = copy.deepcopy(temp)
         if not self._save_recordings_to_disk():
             return
 
@@ -2090,12 +3084,14 @@ class AutoClickerApp:
             self._set_status(f"Failed reading recordings: {exc}")
             return
 
-        cleaned: dict[str, list[dict[str, object]]] = {}
+        cleaned: dict[str, dict[str, object]] = {}
         if isinstance(data, dict):
-            for name, events in data.items():
-                if not isinstance(name, str) or not isinstance(events, list):
+            for name, raw_package in data.items():
+                if not isinstance(name, str):
                     continue
-                cleaned[name] = self._normalize_recording_events(events)
+                normalized = self._normalize_recording_package(raw_package)
+                if normalized is not None:
+                    cleaned[name] = normalized
 
         self.recordings = cleaned
 
@@ -2114,8 +3110,221 @@ class AutoClickerApp:
             self.recording_combo.configure(values=names)
 
         current = self.selected_recording_var.get().strip()
+        if not current and names:
+            self.selected_recording_var.set(names[0])
+            current = names[0]
         if current and current not in self.recordings:
             self.selected_recording_var.set(names[0] if names else "")
+        self._refresh_macro_editor()
+
+    def _on_recording_selected(self, _event: tk.Event | None = None) -> None:
+        self._refresh_macro_editor()
+
+    @staticmethod
+    def _macro_event_summary(event_type: str, payload: dict[str, object]) -> str:
+        if event_type in {"mouse_move", "mouse_click", "mouse_scroll"}:
+            x = payload.get("x", "")
+            y = payload.get("y", "")
+            if "rx" in payload and "ry" in payload:
+                return f"x={x}, y={y}, rx={payload.get('rx')}, ry={payload.get('ry')}"
+            return f"x={x}, y={y}"
+        if event_type in {"key_press", "key_release"}:
+            return f"key={payload.get('key', '')}"
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+
+    @staticmethod
+    def _event_delays(events: list[dict[str, object]]) -> list[float]:
+        delays: list[float] = []
+        prev_t = 0.0
+        for index, event in enumerate(events):
+            t_val = float(event.get("t", 0.0))
+            if index == 0:
+                delays.append(max(0.0, t_val))
+            else:
+                delays.append(max(0.0, t_val - prev_t))
+            prev_t = t_val
+        return delays
+
+    @staticmethod
+    def _apply_event_delays(events: list[dict[str, object]], delays: list[float]) -> None:
+        t_val = 0.0
+        for index, event in enumerate(events):
+            delay = delays[index] if index < len(delays) else 0.0
+            if index == 0:
+                t_val = max(0.0, delay)
+            else:
+                t_val += max(0.0, delay)
+            event["t"] = round(t_val, 6)
+
+    def _selected_recording_package(self) -> dict[str, object] | None:
+        name = self.selected_recording_var.get().strip()
+        package = self.recordings.get(name)
+        if package is None:
+            return None
+        return package
+
+    def _refresh_macro_editor(self) -> None:
+        if self.macro_step_tree is None:
+            return
+
+        current_selection = self._selected_macro_step_index()
+        self.macro_step_tree.delete(*self.macro_step_tree.get_children())
+
+        package = self._selected_recording_package()
+        events = self._recording_events(package)
+        if not events:
+            self.macro_selected_step_var.set("No step selected")
+            self.macro_step_delay_var.set("0.000")
+            self.macro_step_type_var.set("")
+            self.macro_step_payload_var.set("")
+            return
+
+        delays = self._event_delays(events)
+        for index, event in enumerate(events):
+            event_type = str(event.get("type", ""))
+            payload = event.get("payload")
+            payload_dict = payload if isinstance(payload, dict) else {}
+            summary = self._macro_event_summary(event_type, payload_dict)
+            self.macro_step_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(index + 1, f"{delays[index]:.3f}", event_type, summary),
+            )
+
+        target_index = current_selection if current_selection is not None else 0
+        target_index = max(0, min(target_index, len(events) - 1))
+        self.macro_step_tree.selection_set(str(target_index))
+        self.macro_step_tree.focus(str(target_index))
+        self.macro_step_tree.see(str(target_index))
+        self._load_macro_step_fields(target_index)
+
+    def _selected_macro_step_index(self) -> int | None:
+        if self.macro_step_tree is None:
+            return None
+        selected = self.macro_step_tree.selection()
+        if not selected:
+            return None
+        try:
+            return int(selected[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _load_macro_step_fields(self, index: int) -> None:
+        package = self._selected_recording_package()
+        events = self._recording_events(package)
+        if not (0 <= index < len(events)):
+            return
+
+        delays = self._event_delays(events)
+        event = events[index]
+        payload = event.get("payload")
+        payload_dict = payload if isinstance(payload, dict) else {}
+        self.macro_selected_step_var.set(f"Selected step #{index + 1}")
+        self.macro_step_delay_var.set(f"{delays[index]:.3f}")
+        self.macro_step_type_var.set(str(event.get("type", "")))
+        self.macro_step_payload_var.set(json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":")))
+
+    def _on_macro_step_selected(self, _event: tk.Event | None = None) -> None:
+        index = self._selected_macro_step_index()
+        if index is None:
+            return
+        self._load_macro_step_fields(index)
+
+    def _save_recordings_after_editor_change(self) -> bool:
+        if not self._save_recordings_to_disk():
+            return False
+        self._refresh_macro_editor()
+        return True
+
+    def _apply_macro_step_edit(self) -> None:
+        package = self._selected_recording_package()
+        events = self._recording_events(package)
+        index = self._selected_macro_step_index()
+        if package is None or index is None or not (0 <= index < len(events)):
+            self._set_status("Select a recording step first")
+            return
+
+        try:
+            delay_seconds = float(self.macro_step_delay_var.get().strip())
+            if delay_seconds < 0:
+                raise ValueError
+        except ValueError:
+            self._set_status("Delay must be a non-negative number")
+            return
+
+        step_type = self.macro_step_type_var.get().strip()
+        if step_type not in {"key_press", "key_release", "mouse_move", "mouse_click", "mouse_scroll"}:
+            self._set_status("Invalid step type")
+            return
+
+        payload_raw = self.macro_step_payload_var.get().strip()
+        if not payload_raw:
+            payload_raw = "{}"
+        try:
+            payload_obj = json.loads(payload_raw)
+        except json.JSONDecodeError:
+            self._set_status("Payload JSON is invalid")
+            return
+        if not isinstance(payload_obj, dict):
+            self._set_status("Payload JSON must decode to an object")
+            return
+
+        delays = self._event_delays(events)
+        delays[index] = delay_seconds
+        events[index]["type"] = step_type
+        events[index]["payload"] = payload_obj
+        self._apply_event_delays(events, delays)
+        if self._save_recordings_after_editor_change():
+            self._set_status(f"Updated step #{index + 1}")
+
+    def _move_macro_step_up(self) -> None:
+        package = self._selected_recording_package()
+        events = self._recording_events(package)
+        index = self._selected_macro_step_index()
+        if package is None or index is None or index <= 0 or index >= len(events):
+            return
+
+        delays = self._event_delays(events)
+        events[index - 1], events[index] = events[index], events[index - 1]
+        delays[index - 1], delays[index] = delays[index], delays[index - 1]
+        self._apply_event_delays(events, delays)
+        if self._save_recordings_after_editor_change():
+            if self.macro_step_tree is not None:
+                self.macro_step_tree.selection_set(str(index - 1))
+            self._set_status(f"Moved step #{index + 1} up")
+
+    def _move_macro_step_down(self) -> None:
+        package = self._selected_recording_package()
+        events = self._recording_events(package)
+        index = self._selected_macro_step_index()
+        if package is None or index is None or not (0 <= index < len(events) - 1):
+            return
+
+        delays = self._event_delays(events)
+        events[index], events[index + 1] = events[index + 1], events[index]
+        delays[index], delays[index + 1] = delays[index + 1], delays[index]
+        self._apply_event_delays(events, delays)
+        if self._save_recordings_after_editor_change():
+            if self.macro_step_tree is not None:
+                self.macro_step_tree.selection_set(str(index + 1))
+            self._set_status(f"Moved step #{index + 1} down")
+
+    def _delete_macro_step(self) -> None:
+        package = self._selected_recording_package()
+        events = self._recording_events(package)
+        index = self._selected_macro_step_index()
+        if package is None or index is None or not (0 <= index < len(events)):
+            return
+
+        del events[index]
+        if events:
+            delays = self._event_delays(events)
+            delays[0] = 0.0
+            self._apply_event_delays(events, delays)
+
+        if self._save_recordings_after_editor_change():
+            self._set_status(f"Deleted step #{index + 1}")
 
     def _play_recording_hotkey(self) -> None:
         self._play_selected_recording_once()
@@ -2126,7 +3335,8 @@ class AutoClickerApp:
             self._set_status("No recording selected")
             return
 
-        events = self.recordings.get(name)
+        package = self.recordings.get(name)
+        events = self._recording_events(package)
         if not events:
             self._set_status(f"Recording '{name}' is empty or missing")
             return
@@ -2140,7 +3350,13 @@ class AutoClickerApp:
             return
 
         local_stop = threading.Event()
-        played = self._play_recording_events(events, speed, local_stop)
+        played = self._play_recording_events(
+            package,
+            speed,
+            local_stop,
+            dry_run=self.macro_dry_run_var.get(),
+            reanchor_window=self.macro_reanchor_window_var.get(),
+        )
         if played:
             self._set_status(f"Played recording '{name}'")
 
@@ -2149,15 +3365,75 @@ class AutoClickerApp:
             return keyboard.KeyCode.from_char(token)
         return self._parse_keyboard_key(token)
 
+    def _build_recording_playback_context(
+        self,
+        package: dict[str, object] | None,
+        reanchor_window: bool,
+    ) -> dict[str, object]:
+        meta = self._recording_meta(package)
+        coordinate_mode = str(meta.get("coordinate_mode", "absolute")).strip().lower()
+        if coordinate_mode not in {"absolute", "window_relative"}:
+            coordinate_mode = "absolute"
+
+        anchor_rect = self._normalize_anchor_rect(meta.get("anchor_rect"))
+        _, current_rect = self._foreground_window_info()
+
+        offset_x = 0
+        offset_y = 0
+        if reanchor_window and anchor_rect is not None and current_rect is not None:
+            offset_x = int(current_rect[0] - anchor_rect[0])
+            offset_y = int(current_rect[1] - anchor_rect[1])
+
+        target_rect = anchor_rect
+        if reanchor_window and current_rect is not None:
+            target_rect = current_rect
+
+        return {
+            "coordinate_mode": coordinate_mode,
+            "anchor_rect": anchor_rect,
+            "target_rect": target_rect,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+        }
+
+    def _resolve_playback_point(
+        self,
+        payload: dict[str, object],
+        playback_context: dict[str, object],
+    ) -> tuple[int, int]:
+        x = int(payload.get("x", 0))
+        y = int(payload.get("y", 0))
+
+        coordinate_mode = str(playback_context.get("coordinate_mode", "absolute"))
+        target_rect = playback_context.get("target_rect")
+        if coordinate_mode == "window_relative" and isinstance(target_rect, tuple):
+            if "rx" in payload and "ry" in payload:
+                try:
+                    rel_x = int(float(payload.get("rx", 0)))
+                    rel_y = int(float(payload.get("ry", 0)))
+                    return int(target_rect[0] + rel_x), int(target_rect[1] + rel_y)
+                except (TypeError, ValueError):
+                    pass
+
+        offset_x = int(playback_context.get("offset_x", 0))
+        offset_y = int(playback_context.get("offset_y", 0))
+        return x + offset_x, y + offset_y
+
     def _play_recording_events(
         self,
-        events: list[dict[str, object]],
+        package: dict[str, object] | None,
         speed: float,
         stop_event: threading.Event,
+        dry_run: bool,
+        reanchor_window: bool,
     ) -> bool:
-        normalized = self._normalize_recording_events(events)
+        normalized = self._normalize_recording_events(self._recording_events(package))
         if not normalized:
             return False
+
+        playback_context = self._build_recording_playback_context(package, reanchor_window)
+        if dry_run:
+            self._schedule_dry_run_overlay_clear()
 
         previous_t = 0.0
         for item in normalized:
@@ -2172,11 +3448,21 @@ class AutoClickerApp:
 
             event_type = str(item["type"])
             payload = item["payload"] if isinstance(item["payload"], dict) else {}
-            self._execute_recording_event(event_type, payload)
+            if dry_run:
+                self._visualize_recording_event(event_type, payload, playback_context)
+            else:
+                self._execute_recording_event(event_type, payload, playback_context)
 
+        if dry_run:
+            self._schedule_dry_run_overlay_clear()
         return True
 
-    def _execute_recording_event(self, event_type: str, payload: dict[str, object]) -> None:
+    def _execute_recording_event(
+        self,
+        event_type: str,
+        payload: dict[str, object],
+        playback_context: dict[str, object],
+    ) -> None:
         try:
             if event_type == "key_press":
                 token = str(payload.get("key", ""))
@@ -2193,14 +3479,12 @@ class AutoClickerApp:
                 return
 
             if event_type == "mouse_move":
-                x = int(payload.get("x", 0))
-                y = int(payload.get("y", 0))
+                x, y = self._resolve_playback_point(payload, playback_context)
                 self.mouse_controller.position = (x, y)
                 return
 
             if event_type == "mouse_click":
-                x = int(payload.get("x", 0))
-                y = int(payload.get("y", 0))
+                x, y = self._resolve_playback_point(payload, playback_context)
                 button_token = str(payload.get("button", "left"))
                 pressed = bool(payload.get("pressed", False))
                 button = self._button_from_token(button_token)
@@ -2214,12 +3498,142 @@ class AutoClickerApp:
                 return
 
             if event_type == "mouse_scroll":
-                x = int(payload.get("x", 0))
-                y = int(payload.get("y", 0))
+                x, y = self._resolve_playback_point(payload, playback_context)
                 dx = int(float(payload.get("dx", 0.0)))
                 dy = int(float(payload.get("dy", 0.0)))
                 self.mouse_controller.position = (x, y)
                 self.mouse_controller.scroll(dx, dy)
+        except Exception:
+            return
+
+    def _visualize_recording_event(
+        self,
+        event_type: str,
+        payload: dict[str, object],
+        playback_context: dict[str, object],
+    ) -> None:
+        if event_type not in {"mouse_move", "mouse_click", "mouse_scroll"}:
+            return
+        x, y = self._resolve_playback_point(payload, playback_context)
+        try:
+            self.root.after(0, lambda px=x, py=y, et=event_type: self._draw_dry_run_marker(px, py, et))
+        except tk.TclError:
+            return
+
+    def _schedule_dry_run_overlay_clear(self) -> None:
+        try:
+            self.root.after(0, self._schedule_dry_run_overlay_clear_on_ui)
+        except tk.TclError:
+            pass
+
+    def _schedule_dry_run_overlay_clear_on_ui(self) -> None:
+        if self.dry_run_clear_after_id is not None:
+            try:
+                self.root.after_cancel(self.dry_run_clear_after_id)
+            except tk.TclError:
+                pass
+            self.dry_run_clear_after_id = None
+        try:
+            self.dry_run_clear_after_id = self.root.after(1200, self._destroy_dry_run_overlay)
+        except tk.TclError:
+            self.dry_run_clear_after_id = None
+
+    def _ensure_dry_run_overlay(self) -> bool:
+        if self.dry_run_overlay is not None and self.dry_run_canvas is not None:
+            try:
+                if self.dry_run_overlay.winfo_exists():
+                    return True
+            except tk.TclError:
+                pass
+
+        x1, y1, x2, y2 = self._virtual_screen_bounds()
+        if x1 == x2 and y1 == y2:
+            x1, y1 = 0, 0
+            x2 = self.root.winfo_screenwidth()
+            y2 = self.root.winfo_screenheight()
+
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+
+        overlay = tk.Toplevel(self.root)
+        overlay.overrideredirect(True)
+        overlay.attributes("-topmost", True)
+        overlay.geometry(f"{width}x{height}+{x1}+{y1}")
+
+        transparent_bg = "#113355"
+        overlay.configure(bg=transparent_bg)
+        try:
+            overlay.wm_attributes("-transparentcolor", transparent_bg)
+        except tk.TclError:
+            overlay.attributes("-alpha", 0.2)
+
+        canvas = tk.Canvas(overlay, bg=transparent_bg, highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        self._make_overlay_click_through(overlay)
+
+        self.dry_run_overlay = overlay
+        self.dry_run_canvas = canvas
+        self.dry_run_overlay_origin = (x1, y1)
+        self.dry_run_last_point = None
+        return True
+
+    def _draw_dry_run_marker(self, x: int, y: int, event_type: str) -> None:
+        if not self._ensure_dry_run_overlay():
+            return
+        if self.dry_run_canvas is None:
+            return
+
+        canvas = self.dry_run_canvas
+        origin_x, origin_y = self.dry_run_overlay_origin
+        px = x - origin_x
+        py = y - origin_y
+
+        if self.dry_run_last_point is not None and event_type in {"mouse_move", "mouse_click", "mouse_scroll"}:
+            lx, ly = self.dry_run_last_point
+            canvas.create_line(lx, ly, px, py, fill="#60a5fa", width=2, tags="dry-run")
+
+        if event_type == "mouse_click":
+            canvas.create_oval(px - 8, py - 8, px + 8, py + 8, outline="#ef4444", width=2, tags="dry-run")
+        elif event_type == "mouse_scroll":
+            canvas.create_rectangle(px - 7, py - 7, px + 7, py + 7, outline="#f59e0b", width=2, tags="dry-run")
+        else:
+            canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill="#22c55e", outline="", tags="dry-run")
+
+        self.dry_run_last_point = (px, py)
+        self._schedule_dry_run_overlay_clear_on_ui()
+
+    def _destroy_dry_run_overlay(self) -> None:
+        self.dry_run_last_point = None
+        if self.dry_run_clear_after_id is not None:
+            try:
+                self.root.after_cancel(self.dry_run_clear_after_id)
+            except tk.TclError:
+                pass
+            self.dry_run_clear_after_id = None
+
+        if self.dry_run_overlay is not None:
+            try:
+                self.dry_run_overlay.destroy()
+            except tk.TclError:
+                pass
+        self.dry_run_overlay = None
+        self.dry_run_canvas = None
+
+    @staticmethod
+    def _make_overlay_click_through(window: tk.Toplevel) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            hwnd = int(window.winfo_id())
+            user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080
+            style = int(user32.GetWindowLongW(hwnd, GWL_EXSTYLE))
+            style |= WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
         except Exception:
             return
 
@@ -2258,6 +3672,7 @@ class AutoClickerApp:
 
         canvas = tk.Canvas(overlay, bg=transparent_bg, highlightthickness=0)
         canvas.pack(fill="both", expand=True)
+        self._make_overlay_click_through(overlay)
 
         self.crosshair_overlay = overlay
         self.crosshair_canvas = canvas
@@ -2709,9 +4124,11 @@ class AutoClickerApp:
             self._set_status("Anti-detection values must be valid non-negative numbers")
             return None
 
-        condition_logic_mode = self.condition_logic_mode_var.get().strip().lower()
-        if condition_logic_mode not in {"and", "or"}:
-            self._set_status("Rule logic mode must be 'and' or 'or'")
+        condition_logic_mode = "and"
+
+        color_trigger_mode = self.color_trigger_mode_var.get().strip().lower()
+        if color_trigger_mode not in {"continuous", "single"}:
+            self._set_status("Color trigger mode must be continuous or single")
             return None
 
         window_binding_enabled = self.window_binding_enabled_var.get()
@@ -2737,7 +4154,8 @@ class AutoClickerApp:
             if not selected_recording_name:
                 self._set_status("Macro mode is enabled but no recording is selected")
                 return None
-            recording_events = self.recordings.get(selected_recording_name)
+            recording_package = self.recordings.get(selected_recording_name)
+            recording_events = self._recording_events(recording_package)
             if not recording_events:
                 self._set_status(f"Selected recording '{selected_recording_name}' is missing or empty")
                 return None
@@ -2815,7 +4233,7 @@ class AutoClickerApp:
             time_window_enabled=time_window_enabled,
             allowed_start_time=allowed_start_time,
             allowed_end_time=allowed_end_time,
-            edge_trigger_enabled=self.edge_trigger_var.get(),
+            edge_trigger_enabled=(color_trigger_mode == "single"),
             anti_detection_enabled=self.anti_detection_enabled_var.get(),
             anti_detection_jitter_pct=anti_detection_jitter_pct,
             anti_detection_pause_chance=anti_detection_pause_chance,
@@ -2823,6 +4241,8 @@ class AutoClickerApp:
             use_macro_recording=use_macro_recording,
             selected_recording_name=selected_recording_name,
             macro_speed=macro_speed,
+            macro_reanchor_window=self.macro_reanchor_window_var.get(),
+            macro_dry_run=self.macro_dry_run_var.get(),
         )
 
     def _sleep_with_stop(self, duration: float) -> bool:
@@ -2911,7 +4331,23 @@ class AutoClickerApp:
 
         return False
 
+    def _append_run_log(self, entry: dict[str, object]) -> None:
+        try:
+            with open(self.run_log_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+        except Exception as exc:
+            self._set_status(f"Failed writing run log: {exc}")
+
+    @staticmethod
+    def _safe_ratio(numerator: int, denominator: int) -> float:
+        if denominator <= 0:
+            return 0.0
+        return round(numerator / denominator, 4)
+
     def _click_loop(self, settings: ClickSettings) -> None:
+        run_started_at = datetime.utcnow()
+        run_id = run_started_at.strftime("%Y%m%dT%H%M%S.%fZ")
+
         if self._countdown_start_delay(settings.start_delay):
             self.running = False
             self._set_status("Stopped")
@@ -2920,6 +4356,19 @@ class AutoClickerApp:
         click_count = 0
         run_start = time.monotonic()
         stop_reason: str | None = None
+        fire_count = 0
+        macro_playback_count = 0
+        condition_counts: dict[str, int] = {
+            "iterations": 0,
+            "color_pass": 0,
+            "color_fail": 0,
+            "window_pass": 0,
+            "window_fail": 0,
+            "time_pass": 0,
+            "time_fail": 0,
+            "combined_true": 0,
+            "combined_false": 0,
+        }
 
         self._set_status("Running")
         self._set_session_info(click_count, 0.0)
@@ -2929,6 +4378,7 @@ class AutoClickerApp:
                 time.sleep(0.05)
                 continue
 
+            condition_counts["iterations"] += 1
             elapsed = time.monotonic() - run_start
             if settings.stop_after_seconds is not None and elapsed >= settings.stop_after_seconds:
                 stop_reason = f"Stopped: reached {settings.stop_after_seconds:.2f}s limit"
@@ -2936,31 +4386,58 @@ class AutoClickerApp:
 
             enabled_condition_results: list[bool] = []
             if settings.use_color:
-                enabled_condition_results.append(self._sample_matches_color(settings))
+                color_match = self._sample_matches_color(settings)
+                enabled_condition_results.append(color_match)
+                if color_match:
+                    condition_counts["color_pass"] += 1
+                else:
+                    condition_counts["color_fail"] += 1
 
             if settings.window_binding_enabled:
                 current_title = self._current_window_title().lower()
-                enabled_condition_results.append(settings.window_title_rule.lower() in current_title)
+                window_match = settings.window_title_rule.lower() in current_title
+                enabled_condition_results.append(window_match)
+                if window_match:
+                    condition_counts["window_pass"] += 1
+                else:
+                    condition_counts["window_fail"] += 1
 
             if settings.time_window_enabled:
-                enabled_condition_results.append(
-                    self._time_window_allows(settings.allowed_start_time, settings.allowed_end_time)
-                )
+                time_match = self._time_window_allows(settings.allowed_start_time, settings.allowed_end_time)
+                enabled_condition_results.append(time_match)
+                if time_match:
+                    condition_counts["time_pass"] += 1
+                else:
+                    condition_counts["time_fail"] += 1
 
             should_fire = evaluate_rule_conditions(enabled_condition_results, settings.condition_logic_mode)
+            if should_fire:
+                condition_counts["combined_true"] += 1
+            else:
+                condition_counts["combined_false"] += 1
 
             if should_fire:
+                fire_count += 1
                 if settings.use_macro_recording:
                     if settings.stop_after_clicks is not None and click_count >= settings.stop_after_clicks:
                         stop_reason = f"Stopped: reached {settings.stop_after_clicks} action limit"
                         break
 
-                    events = self.recordings.get(settings.selected_recording_name, [])
-                    played = self._play_recording_events(events, settings.macro_speed, self.stop_event)
+                    package = self.recordings.get(settings.selected_recording_name)
+                    played = self._play_recording_events(
+                        package,
+                        settings.macro_speed,
+                        self.stop_event,
+                        dry_run=settings.macro_dry_run,
+                        reanchor_window=settings.macro_reanchor_window,
+                    )
                     if played:
                         click_count += 1
+                        macro_playback_count += 1
                 else:
                     burst_count = settings.burst_count
+                    if settings.use_color and settings.edge_trigger_enabled:
+                        burst_count = 1
                     if settings.stop_after_clicks is not None:
                         remaining_actions = settings.stop_after_clicks - click_count
                         if remaining_actions <= 0:
@@ -2993,10 +4470,65 @@ class AutoClickerApp:
                 break
 
         self.running = False
-        if stop_reason is not None:
-            self._set_status(stop_reason)
-        else:
-            self._set_status("Stopped")
+        if stop_reason is None:
+            stop_reason = "Stopped by user" if self.stop_event.is_set() else "Stopped"
+        self._set_status(stop_reason)
+
+        run_ended_at = datetime.utcnow()
+        elapsed = max(0.0, time.monotonic() - run_start)
+        iterations = condition_counts["iterations"]
+        run_log_entry: dict[str, object] = {
+            "run_id": run_id,
+            "started_at": run_started_at.isoformat(timespec="seconds") + "Z",
+            "ended_at": run_ended_at.isoformat(timespec="seconds") + "Z",
+            "duration_s": round(elapsed, 3),
+            "stop_reason": stop_reason,
+            "mode": "macro" if settings.use_macro_recording else "action",
+            "selected_recording": settings.selected_recording_name if settings.use_macro_recording else "",
+            "macro_speed": settings.macro_speed,
+            "macro_reanchor_window": settings.macro_reanchor_window,
+            "macro_dry_run": settings.macro_dry_run,
+            "action_count": click_count,
+            "fires": fire_count,
+            "macro_playbacks": macro_playback_count,
+            "condition_checks": {
+                "iterations": iterations,
+                "logic_mode": settings.condition_logic_mode,
+                "color": {
+                    "enabled": settings.use_color,
+                    "pass": condition_counts["color_pass"],
+                    "fail": condition_counts["color_fail"],
+                    "pass_rate": self._safe_ratio(
+                        condition_counts["color_pass"],
+                        condition_counts["color_pass"] + condition_counts["color_fail"],
+                    ),
+                },
+                "window": {
+                    "enabled": settings.window_binding_enabled,
+                    "pass": condition_counts["window_pass"],
+                    "fail": condition_counts["window_fail"],
+                    "pass_rate": self._safe_ratio(
+                        condition_counts["window_pass"],
+                        condition_counts["window_pass"] + condition_counts["window_fail"],
+                    ),
+                },
+                "time": {
+                    "enabled": settings.time_window_enabled,
+                    "pass": condition_counts["time_pass"],
+                    "fail": condition_counts["time_fail"],
+                    "pass_rate": self._safe_ratio(
+                        condition_counts["time_pass"],
+                        condition_counts["time_pass"] + condition_counts["time_fail"],
+                    ),
+                },
+                "combined": {
+                    "true": condition_counts["combined_true"],
+                    "false": condition_counts["combined_false"],
+                    "true_rate": self._safe_ratio(condition_counts["combined_true"], iterations),
+                },
+            },
+        }
+        self._append_run_log(run_log_entry)
 
     def toggle_running(self) -> None:
         if self.running:
@@ -3063,6 +4595,7 @@ class AutoClickerApp:
             "target_color_var",
             "tolerance_var",
             "edge_trigger_var",
+            "color_trigger_mode_var",
             "pixel_history_enabled_var",
             "condition_logic_mode_var",
             "color_sample_mode_var",
@@ -3085,6 +4618,9 @@ class AutoClickerApp:
             "selected_recording_var",
             "recording_name_var",
             "macro_speed_var",
+            "recording_coordinate_mode_var",
+            "macro_reanchor_window_var",
+            "macro_dry_run_var",
         ]
 
         payload: dict[str, object] = {}
@@ -3104,13 +4640,16 @@ class AutoClickerApp:
                 except tk.TclError:
                     continue
 
+        if "color_trigger_mode_var" not in payload:
+            self.color_trigger_mode_var.set("single" if self.edge_trigger_var.get() else "continuous")
+        self.condition_logic_mode_var.set("and")
+
         if self.monitor_var.get() not in self.monitor_options:
             self.monitor_var.set(next(iter(self.monitor_options.keys()), "All monitors"))
 
         self._sync_action_controls()
         self._sync_hold_controls()
         self._sync_timing_controls()
-        self._set_color_options_visible(self.color_options_visible_var.get())
         self._sync_color_mode_controls()
         self._sync_safety_controls()
         self._sync_rule_controls()
@@ -3220,6 +4759,7 @@ class AutoClickerApp:
         self._stop_recording_capture()
         self._stop_inkdropper()
         self._stop_crosshair()
+        self._destroy_dry_run_overlay()
         self._close_test_window()
 
         if self.hotkey_listener is not None:
